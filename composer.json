@@ -1,0 +1,22 @@
+{
+    "name": "mgenchev/wp-cli-optimize-images",
+    "description": "A WP-CLI command for optimizing images with the TinyPNG API.",
+    "type": "wp-cli-package",
+    "license": "MIT",
+    "homepage": "https://github.com/mgenchev/wp-cli-optimize-images",
+    "keywords": [
+        "wordpress",
+        "wp-cli",
+        "tinypng",
+        "image-optimization",
+        "images"
+    ],
+    "require": {
+        "php": ">=8.1"
+    },
+    "autoload": {
+        "files": [
+            "src/OptimizeImagesCommand.php"
+        ]
+    }
+}
