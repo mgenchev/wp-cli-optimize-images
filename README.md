@@ -2,17 +2,20 @@
 
 A global WP-CLI command for optimizing and resizing images for the web.
 
-The package uses **TinyPNG** as the preferred optimization engine and automatically falls back to a free local optimizer powered by **Sharp/libvips** when TinyPNG is unavailable.
+The package uses **TinyPNG** as the preferred optimization engine for raster images and automatically falls back to a free local optimizer powered by **Sharp/libvips** when TinyPNG is unavailable.
+
+SVG files are optimized locally with **SVGO**.
 
 Original images are never modified. Optimized versions are written to a separate output directory.
 
 ## Features
 
-* Optimize JPEG, PNG, WebP and AVIF images
-* TinyPNG optimization by default
+* Optimize JPEG, PNG, WebP, AVIF and SVG images
+* TinyPNG optimization for raster images
 * Automatic free local fallback with Sharp/libvips
+* SVG optimization with SVGO
 * Automatic local optimizer setup when first required
-* Automatic proportional image resizing for web use
+* Automatic proportional image resizing for raster images
 * Default maximum dimensions of 2880 × 2880 px
 * Never upscale smaller images
 * Custom maximum width and height
@@ -36,19 +39,28 @@ Original images are never modified. Optimized versions are written to a separate
 * Status command for checking the current setup
 * Works independently of a specific WordPress installation
 
-The optimization settings are designed for web images with the goal of significantly reducing file size while keeping image quality visually indistinguishable for normal use.
+The optimization settings are designed for web assets with the goal of significantly reducing file size while keeping image quality visually indistinguishable for normal use.
 
-Actual compression depends on the source images. Images that are already optimized may see smaller reductions.
+Actual compression depends on the source files. Images that are already optimized may see smaller reductions.
 
 ## Requirements
 
 * PHP 8.1+
 * WP-CLI
-* Node.js 20.9+ and npm for resizing and local optimization
+* Node.js 20.9+
+* npm
 * PHP cURL extension when using TinyPNG
 * TinyPNG API key is optional
 
-If TinyPNG is not configured or becomes unavailable, the package automatically uses the free local optimizer.
+Node.js is used for:
+
+* image resizing
+* Sharp/libvips local raster optimization
+* SVGO SVG optimization
+
+If TinyPNG is not configured or becomes unavailable, raster images automatically use the free local optimizer.
+
+SVG files are always optimized locally.
 
 ## Installation
 
@@ -68,7 +80,7 @@ No WordPress installation is required to use the command.
 
 ## TinyPNG Configuration
 
-TinyPNG is optional, but it is used as the preferred optimization service when configured.
+TinyPNG is optional but is used as the preferred optimization service for raster images when configured.
 
 Configure your TinyPNG API key:
 
@@ -94,13 +106,13 @@ You only need to configure it once.
 
 If the `TINIFY_API_KEY` environment variable exists, it takes precedence over the stored configuration.
 
-TinyPNG currently includes **500 free compressions each calendar month**.
+If no TinyPNG API key is configured, raster images automatically use the free local optimizer.
 
-If no TinyPNG API key is configured, the package automatically uses the free local optimizer.
+SVG files never use TinyPNG.
 
 ## Image Resizing
 
-Images are resized proportionally by default before final optimization when they exceed:
+Raster images are resized proportionally by default before final optimization when they exceed:
 
 ```text
 2880 × 2880 px
@@ -117,7 +129,7 @@ Examples:
 800 × 600   → unchanged
 ```
 
-This default is intended to provide a practical balance for modern web layouts and high-density displays.
+SVG files are vector-based and are therefore not resized.
 
 ### Custom Maximum Width
 
@@ -152,7 +164,7 @@ Examples:
 
 ### Disable Resizing
 
-To optimize images without changing their pixel dimensions:
+To optimize raster images without changing their pixel dimensions:
 
 ```bash
 wp optimize-images ./images --no-resize
@@ -160,9 +172,11 @@ wp optimize-images ./images --no-resize
 
 `--no-resize` cannot be combined with `--max-width` or `--max-height`.
 
-## Processing
+SVG optimization is unaffected by resize options.
 
-When TinyPNG is configured, images are processed as follows:
+## Raster Image Processing
+
+When TinyPNG is configured, raster images are processed as follows:
 
 ```text
 Source image
@@ -176,25 +190,82 @@ Optimized output
 
 If TinyPNG becomes unavailable, reaches the account limit, or encounters an account/API error, processing automatically continues using Sharp/libvips locally.
 
-If TinyPNG is not configured, the entire batch is processed locally.
+If TinyPNG is not configured, raster images are processed entirely locally.
 
-TinyPNG supports AVIF, WebP, JPEG and PNG images.
+Supported raster formats:
 
-Resize operations are performed locally rather than through the TinyPNG resize API, avoiding additional TinyPNG compression credits for resizing. TinyPNG's API counts each API-side resize as an additional compression.
+* JPEG / JPG
+* PNG
+* WebP
+* AVIF
+
+## SVG Optimization
+
+SVG files are optimized locally using **SVGO**.
+
+They are never uploaded to TinyPNG and do not consume TinyPNG compression credits.
+
+The SVG optimizer uses conservative settings intended for production web assets.
+
+It:
+
+* removes unnecessary metadata
+* removes comments
+* simplifies redundant markup
+* optimizes path data
+* optimizes colors and transforms
+* preserves `viewBox`
+* preserves IDs to avoid breaking CSS, JavaScript or fragment references
+* preserves `<desc>` content for accessibility
+* never resizes SVG files
+
+If the optimized SVG would be larger than the original file, the original file is kept instead.
+
+Example:
+
+```text
+logo.svg  24.18 KB → 11.72 KB (-52%)
+```
+
+SVG files participate normally in:
+
+* caching
+* `--force`
+* `--dry-run`
+* `sync`
+* extension filtering
+* final size statistics
+
+## Local Runtime
+
+The local processing runtime is installed automatically when it is first required.
+
+It contains:
+
+```text
+Sharp / libvips
+SVGO
+```
+
+The runtime is stored globally under:
+
+```text
+~/.wp-cli/optimize-images-local
+```
+
+No manual `npm install` is required.
 
 ## Performance
 
-The command is optimized for processing image directories efficiently.
+The command is optimized for efficiently processing image directories.
 
 ### Batch Local Processing
 
-Sharp processing runs in batches instead of starting a separate Node.js process for every image.
+Local image processing runs in batches rather than starting a separate Node.js process for every file.
 
-This significantly reduces process startup overhead when processing larger directories.
+Instead of:
 
 ```text
-Before
-
 PHP
  ↓
 Node → image 1
@@ -203,7 +274,7 @@ Node → image 3
 Node → image 4
 ```
 
-Now:
+the package uses:
 
 ```text
 PHP
@@ -216,17 +287,21 @@ image 3
 image 4
 ```
 
-Multiple Sharp jobs can be processed concurrently inside the batch.
+Multiple local jobs can be processed concurrently inside the batch.
+
+This applies to both Sharp raster processing and SVG optimization.
 
 ### Concurrent TinyPNG Requests
 
-TinyPNG requests are also processed concurrently in small groups rather than waiting for every image to finish before starting the next one.
+TinyPNG requests are processed concurrently in small groups instead of waiting for each image to finish before starting the next one.
 
-The concurrency level is intentionally conservative to improve performance without aggressively hitting the TinyPNG API.
+The package currently processes up to:
 
-Tinify recommends adding delay when API rate limits are reached, so the package avoids excessive parallel requests.
+```text
+3 TinyPNG requests concurrently
+```
 
-The command currently processes up to **3 TinyPNG requests concurrently**.
+The concurrency level is intentionally conservative to improve performance without aggressively hitting API rate limits.
 
 ## Status
 
@@ -247,7 +322,7 @@ TinyPNG API key: configured
 Node.js: 22.x.x
 Local optimizer: ready
 Default resize: 2880 × 2880 px
-Supported extensions: jpg, jpeg, png, webp, avif
+Supported extensions: jpg, jpeg, png, webp, avif, svg
 Config: C:/Users/User/.wp-cli/optimize-images.json
 
 Success: Ready.
@@ -273,9 +348,10 @@ Given:
 project/
 └── images/
     ├── hero.jpg
-    ├── logo.png
+    ├── logo.svg
+    ├── icon.png
     └── team/
-        └── member.jpg
+        └── member.webp
 ```
 
 the command creates:
@@ -284,28 +360,30 @@ the command creates:
 project/
 ├── images/
 │   ├── hero.jpg
-│   ├── logo.png
+│   ├── logo.svg
+│   ├── icon.png
 │   └── team/
-│       └── member.jpg
+│       └── member.webp
 │
 └── optimized-images/
     ├── hero.jpg
-    ├── logo.png
+    ├── logo.svg
+    ├── icon.png
     └── team/
-        └── member.jpg
+        └── member.webp
 ```
 
-The original images are never modified.
+The original files are never modified.
 
 ## Custom Output Directory
 
-By default, optimized images are written to a sibling directory named:
+By default, optimized files are written to a sibling directory named:
 
 ```text
 optimized-images
 ```
 
-You can specify a different output directory:
+Specify a different output directory:
 
 ```bash
 wp optimize-images ./images --output=./dist/images
@@ -321,18 +399,24 @@ The output directory cannot be located inside the source directory.
 
 ## Filter by File Extension
 
-By default, all supported image formats are processed.
+By default, all supported formats are processed.
 
-To process only specific extensions:
+Process only JPEG and PNG:
 
 ```bash
 wp optimize-images ./images --extensions=jpg,png
 ```
 
-Only WebP:
+Only SVG:
 
 ```bash
-wp optimize-images ./images --extensions=webp
+wp optimize-images ./images --extensions=svg
+```
+
+SVG and PNG:
+
+```bash
+wp optimize-images ./images --extensions=svg,png
 ```
 
 Options can be combined:
@@ -346,7 +430,7 @@ wp optimize-images ./images \
 
 ## Dry Run
 
-Preview what the command would do without changing files or sending images to TinyPNG:
+Preview what the command would do without changing files or sending raster images to TinyPNG:
 
 ```bash
 wp optimize-images ./images --dry-run
@@ -357,13 +441,13 @@ Example:
 ```text
 Source: D:/Projects/website/images
 Output: D:/Projects/website/optimized-images
-Extensions: jpg,jpeg,png,webp,avif
+Extensions: jpg,jpeg,png,webp,avif,svg
 Resize: max 2880 × 2880 px
 Mode: dry-run
 
 + hero.jpg [6000×4000 → 2880×1920] (would optimize)
-↷ logo.png (unchanged)
-+ team/member.jpg (would optimize)
++ logo.svg (would optimize)
+↷ icon.png (unchanged)
 
 Dry run
 
@@ -382,25 +466,26 @@ Dry-run mode:
 * does not remove files
 * does not call the TinyPNG API
 * does not consume TinyPNG compression credits
+* does not execute Sharp or SVGO optimization
 
 ## Optimization Cache
 
-The command stores SHA-256 hashes and processing settings of successfully optimized source images in:
+The command stores SHA-256 hashes and processing settings for successfully optimized files in:
 
 ```text
 optimized-images/.optimize-images-cache.json
 ```
 
-When the command is run again, unchanged images are skipped:
+When the command runs again, unchanged files are skipped:
 
 ```text
 ↷ hero.jpg (unchanged)
-↷ logo.png (unchanged)
+↷ logo.svg (unchanged)
 ```
 
-If an original image changes, it is automatically processed again.
+If a source file changes, it is automatically processed again.
 
-The cache also tracks processing settings.
+The cache also tracks processing settings for raster images.
 
 For example, changing:
 
@@ -414,19 +499,27 @@ to:
 --max-width=1920
 ```
 
-causes the affected images to be processed again automatically.
+causes the affected raster images to be processed again automatically.
 
-Performance-only package updates do not invalidate already optimized images unless the resulting optimization behavior changes.
+SVG files do not depend on resize settings.
+
+Performance-only package updates do not invalidate previously processed files unless optimization behavior changes.
 
 ## Force Optimization
 
-To ignore the cache and process every selected image again:
+Ignore the cache and process every selected file again:
 
 ```bash
 wp optimize-images /path/to/images --force
 ```
 
-You can combine `--force` with other options:
+Only re-optimize SVG files:
+
+```bash
+wp optimize-images ./images --extensions=svg --force
+```
+
+Combine with other options:
 
 ```bash
 wp optimize-images ./images \
@@ -445,36 +538,22 @@ wp optimize-images sync ./images
 
 Sync performs the following actions:
 
-* new source image → optimize
-* changed source image → re-optimize
-* changed processing settings → re-process
-* unchanged source image → skip
-* deleted source image → remove corresponding optimized image
+* new source file → optimize
+* changed source file → re-optimize
+* changed raster processing settings → re-process
+* unchanged source file → skip
+* deleted source file → remove corresponding optimized file
 * empty output directories → clean up
+
+This includes SVG files.
 
 Example:
 
-Before:
-
 ```text
 images/
 ├── hero.jpg
-├── logo.png
-└── old-banner.jpg
-
-optimized-images/
-├── hero.jpg
-├── logo.png
-└── old-banner.jpg
-```
-
-After changing the source directory:
-
-```text
-images/
-├── hero.jpg
-├── logo.png
-└── new-banner.jpg
+├── logo.svg
+└── new-icon.svg
 ```
 
 Run:
@@ -486,15 +565,15 @@ wp optimize-images sync ./images
 Example output:
 
 ```text
-− old-banner.jpg (removed)
+− old-icon.svg (removed)
 ↷ hero.jpg (unchanged)
-↷ logo.png (unchanged)
-✓ new-banner.jpg [5000×3200 → 2880×1843]  4.20 MB → 512 KB (-88%)
+↷ logo.svg (unchanged)
+✓ new-icon.svg  8.72 KB → 4.11 KB (-53%)
 ```
 
 ## Sync Dry Run
 
-Preview a sync operation without changing anything:
+Preview synchronization without changing anything:
 
 ```bash
 wp optimize-images sync ./images --dry-run
@@ -504,14 +583,14 @@ Example:
 
 ```text
 ↷ hero.jpg (unchanged)
-+ new-banner.jpg [5000×3200 → 2880×1843] (would optimize)
-- old-banner.jpg (would remove)
++ new-icon.svg (would optimize)
+- old-icon.svg (would remove)
 
 Dry run
 
   Found:             2
   Would optimize:    1
-  Would resize:      1
+  Would resize:      0
   Unchanged:         1
   Would remove:      1
   Source size:       6.82 MB
@@ -545,6 +624,20 @@ TinyPNG
 Success: Images optimized successfully.
 ```
 
+SVG files are included in:
+
+```text
+Found
+Optimized
+Skipped
+Failed
+Before
+After
+Saved
+```
+
+but never increase the TinyPNG compression count.
+
 When `sync` removes files, the summary also includes:
 
 ```text
@@ -555,12 +648,15 @@ TinyPNG usage is displayed when the API provides the current monthly compression
 
 ## Supported Formats
 
-* JPEG / JPG
-* PNG
-* WebP
-* AVIF
+| Format     | Optimization | Resize | TinyPNG |
+| ---------- | ------------ | ------ | ------- |
+| JPEG / JPG | Yes          | Yes    | Yes     |
+| PNG        | Yes          | Yes    | Yes     |
+| WebP       | Yes          | Yes    | Yes     |
+| AVIF       | Yes          | Yes    | Yes     |
+| SVG        | Yes          | No     | No      |
 
-SVG optimization is currently not included.
+SVG optimization is handled locally with SVGO.
 
 ## Command Overview
 
@@ -571,8 +667,11 @@ wp optimize-images configure
 # Check configuration
 wp optimize-images status
 
-# Optimize with default 2880 × 2880 max dimensions
+# Optimize all supported files
 wp optimize-images ./images
+
+# Optimize only SVG files
+wp optimize-images ./images --extensions=svg
 
 # Custom maximum width
 wp optimize-images ./images --max-width=1920
@@ -583,14 +682,14 @@ wp optimize-images ./images --max-height=1600
 # Custom maximum dimensions
 wp optimize-images ./images --max-width=1920 --max-height=1920
 
-# Disable resizing
+# Disable raster resizing
 wp optimize-images ./images --no-resize
 
 # Custom output
 wp optimize-images ./images --output=./dist/images
 
 # Specific extensions
-wp optimize-images ./images --extensions=jpg,png
+wp optimize-images ./images --extensions=jpg,png,svg
 
 # Preview without making changes
 wp optimize-images ./images --dry-run
@@ -627,7 +726,7 @@ The global TinyPNG configuration can be removed separately by deleting:
 ~/.wp-cli/optimize-images.json
 ```
 
-The automatically installed local optimizer runtime can also be removed by deleting:
+The automatically installed local runtime can also be removed by deleting:
 
 ```text
 ~/.wp-cli/optimize-images-local

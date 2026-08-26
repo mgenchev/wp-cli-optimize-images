@@ -28,6 +28,7 @@ class Optimize_Images_Command {
 		'png',
 		'webp',
 		'avif',
+		'svg',
 	];
 
 	private const CONFIG_FILENAME = 'optimize-images.json';
@@ -35,6 +36,7 @@ class Optimize_Images_Command {
 	private const LOCAL_RUNTIME_DIRNAME = 'optimize-images-local';
 	private const LOCAL_OPTIMIZER_FILENAME = 'local-optimizer.cjs';
 	private const SHARP_VERSION = '^0.35.0';
+	private const SVGO_VERSION = '^4.1.0';
 	private const MINIMUM_NODE_VERSION = '20.9.0';
 	private const DEFAULT_MAX_WIDTH = 2880;
 	private const DEFAULT_MAX_HEIGHT = 2880;
@@ -277,40 +279,59 @@ class Optimize_Images_Command {
 		}
 
 		if ( ! empty( $processable ) ) {
-			if ( $api_key ) {
-				$tinypng_jobs = $this->prepare_tinypng_jobs(
-					$processable,
-					$resize_settings
+			$svg_jobs = array_filter(
+				$processable,
+				static fn( $job ) => 'svg' === $job['file']['extension']
+			);
+
+			$raster_jobs = array_filter(
+				$processable,
+				static fn( $job ) => 'svg' !== $job['file']['extension']
+			);
+
+			if ( ! empty( $svg_jobs ) ) {
+				$results = array_replace(
+					$results,
+					$this->optimize_local_batch( $svg_jobs, $resize_settings )
 				);
+			}
 
-				$tinypng_results = $this->optimize_tinypng_batch(
-					$tinypng_jobs['jobs'],
-					$api_key
-				);
-
-				$results = array_replace( $results, $tinypng_results['results'] );
-				$fallback_keys = $tinypng_results['fallback_keys'];
-
-				$this->cleanup_temp_directory( $tinypng_jobs['temp_dir'] );
-
-				if ( ! empty( $fallback_keys ) ) {
-					$fallback_jobs = array_intersect_key(
-						$processable,
-						array_fill_keys( $fallback_keys, true )
-					);
-
-					$local_results = $this->optimize_local_batch(
-						$fallback_jobs,
+			if ( ! empty( $raster_jobs ) ) {
+				if ( $api_key ) {
+					$tinypng_jobs = $this->prepare_tinypng_jobs(
+						$raster_jobs,
 						$resize_settings
 					);
 
-					$results = array_replace( $results, $local_results );
+					$tinypng_results = $this->optimize_tinypng_batch(
+						$tinypng_jobs['jobs'],
+						$api_key
+					);
+
+					$results = array_replace( $results, $tinypng_results['results'] );
+					$fallback_keys = $tinypng_results['fallback_keys'];
+
+					$this->cleanup_temp_directory( $tinypng_jobs['temp_dir'] );
+
+					if ( ! empty( $fallback_keys ) ) {
+						$fallback_jobs = array_intersect_key(
+							$raster_jobs,
+							array_fill_keys( $fallback_keys, true )
+						);
+
+						$local_results = $this->optimize_local_batch(
+							$fallback_jobs,
+							$resize_settings
+						);
+
+						$results = array_replace( $results, $local_results );
+					}
+				} else {
+					$results = array_replace(
+						$results,
+						$this->optimize_local_batch( $raster_jobs, $resize_settings )
+					);
 				}
-			} else {
-				$results = array_replace(
-					$results,
-					$this->optimize_local_batch( $processable, $resize_settings )
-				);
 			}
 		}
 
@@ -736,13 +757,19 @@ class Optimize_Images_Command {
 				. '.tmp-'
 				. bin2hex( random_bytes( 6 ) );
 
+			$is_svg = 'svg' === $job['file']['extension'];
+
 			$batch_jobs[ $cache_key ] = [
-				'mode' => 'optimize',
+				'mode' => $is_svg ? 'svg-optimize' : 'optimize',
 				'input' => $job['file']['source'],
 				'output' => $temp_target,
 				'extension' => $job['file']['extension'],
-				'max_width' => $resize_settings['enabled'] ? $resize_settings['max_width'] : 0,
-				'max_height' => $resize_settings['enabled'] ? $resize_settings['max_height'] : 0,
+				'max_width' => ! $is_svg && $resize_settings['enabled']
+					? $resize_settings['max_width']
+					: 0,
+				'max_height' => ! $is_svg && $resize_settings['enabled']
+					? $resize_settings['max_height']
+					: 0,
 			];
 		}
 
@@ -1001,6 +1028,7 @@ class Optimize_Images_Command {
 			'private' => true,
 			'dependencies' => [
 				'sharp' => self::SHARP_VERSION,
+				'svgo' => self::SVGO_VERSION,
 			],
 		];
 		$json = json_encode( $package_json, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES );
@@ -1614,6 +1642,7 @@ class Optimize_Images_Command {
 
 		return file_exists( $this->get_local_optimizer_script() )
 			&& file_exists( $runtime_dir . '/node_modules/sharp/package.json' )
+			&& file_exists( $runtime_dir . '/node_modules/svgo/package.json' )
 			&& $node_version
 			&& version_compare( $node_version, self::MINIMUM_NODE_VERSION, '>=' );
 	}
@@ -1701,7 +1730,7 @@ class Optimize_Images_Command {
 			[
 				'type' => 'assoc',
 				'name' => 'extensions',
-				'description' => 'Comma-separated extensions, e.g. jpg,png.',
+				'description' => 'Comma-separated extensions, e.g. jpg,png,svg.',
 				'optional' => true,
 			],
 			[
@@ -1752,7 +1781,7 @@ class Optimize_Images_Command {
 
     wp optimize-images ./images --output=./dist/images
 
-    wp optimize-images ./images --extensions=jpg,png
+    wp optimize-images ./images --extensions=jpg,png,svg
 
     wp optimize-images ./images --dry-run
 

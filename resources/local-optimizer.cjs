@@ -1,6 +1,7 @@
 const fs = require('fs/promises');
 const path = require('path');
 const sharp = require('sharp');
+const { optimize: optimizeSvg } = require('svgo');
 
 const [, , mode, manifestPath, resultPath] = process.argv;
 
@@ -92,28 +93,57 @@ function encodeOptimizedOutput(image, ext) {
 	}
 }
 
+async function processSvg(job) {
+	const source = await fs.readFile(job.input, 'utf8');
+
+	const result = optimizeSvg(source, {
+		path: job.input,
+		plugins: [
+			{
+				name: 'preset-default',
+				params: {
+					overrides: {
+						cleanupIds: false,
+						removeDesc: false,
+					},
+				},
+			},
+		],
+	});
+
+	await fs.writeFile(job.output, result.data, 'utf8');
+}
+
+async function processRaster(job) {
+	const ext = String(job.extension || '').toLowerCase();
+	const maxWidth = Number(job.max_width || 0);
+	const maxHeight = Number(job.max_height || 0);
+
+	let image = sharp(job.input).autoOrient();
+	image = resizeImage(image, maxWidth, maxHeight);
+
+	if (job.mode === 'resize') {
+		image = encodeResizeOutput(image, ext);
+	} else if (job.mode === 'optimize') {
+		image = encodeOptimizedOutput(image, ext);
+	} else {
+		throw new Error(`Unsupported processing mode: ${job.mode}`);
+	}
+
+	await image.toFile(job.output);
+}
+
 async function processJob(job) {
 	try {
 		await fs.mkdir(path.dirname(job.output), {
 			recursive: true,
 		});
 
-		const ext = String(job.extension || '').toLowerCase();
-		const maxWidth = Number(job.max_width || 0);
-		const maxHeight = Number(job.max_height || 0);
-
-		let image = sharp(job.input).autoOrient();
-		image = resizeImage(image, maxWidth, maxHeight);
-
-		if (job.mode === 'resize') {
-			image = encodeResizeOutput(image, ext);
-		} else if (job.mode === 'optimize') {
-			image = encodeOptimizedOutput(image, ext);
+		if (job.mode === 'svg-optimize') {
+			await processSvg(job);
 		} else {
-			throw new Error(`Unsupported processing mode: ${job.mode}`);
+			await processRaster(job);
 		}
-
-		await image.toFile(job.output);
 
 		return {
 			id: String(job.id),
