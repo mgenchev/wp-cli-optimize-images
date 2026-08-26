@@ -1,31 +1,15 @@
+const fs = require('fs/promises');
+const path = require('path');
 const sharp = require('sharp');
 
-const [
-	,
-	,
-	mode,
-	input,
-	output,
-	extension,
-	maxWidthValue,
-	maxHeightValue,
-] = process.argv;
+const [, , mode, manifestPath, resultPath] = process.argv;
 
-if (!mode || !input || !output || !extension) {
-	console.error(
-		'Missing mode, input, output or extension.'
-	);
-
+if (mode !== 'batch' || !manifestPath || !resultPath) {
+	console.error('Expected: node local-optimizer.cjs batch <manifest> <result>');
 	process.exit(1);
 }
 
-const maxWidth = parseInt(maxWidthValue || '0', 10);
-const maxHeight = parseInt(maxHeightValue || '0', 10);
-
-/**
- * Apply proportional web-safe resizing.
- */
-function resizeImage(image) {
+function resizeImage(image, maxWidth, maxHeight) {
 	if (!maxWidth && !maxHeight) {
 		return image;
 	}
@@ -38,10 +22,6 @@ function resizeImage(image) {
 	});
 }
 
-/**
- * Encode a high-quality intermediate image
- * before sending it to TinyPNG.
- */
 function encodeResizeOutput(image, ext) {
 	switch (ext) {
 		case 'jpg':
@@ -70,15 +50,10 @@ function encodeResizeOutput(image, ext) {
 			});
 
 		default:
-			throw new Error(
-				`Unsupported extension: ${ext}`
-			);
+			throw new Error(`Unsupported extension: ${ext}`);
 	}
 }
 
-/**
- * Apply final local optimization.
- */
 function encodeOptimizedOutput(image, ext) {
 	switch (ext) {
 		case 'jpg':
@@ -113,45 +88,89 @@ function encodeOptimizedOutput(image, ext) {
 			});
 
 		default:
-			throw new Error(
-				`Unsupported extension: ${ext}`
-			);
+			throw new Error(`Unsupported extension: ${ext}`);
 	}
 }
 
-async function processImage() {
-	const ext = extension.toLowerCase();
+async function processJob(job) {
+	try {
+		await fs.mkdir(path.dirname(job.output), {
+			recursive: true,
+		});
 
-	let image = sharp(input)
-		.autoOrient();
+		const ext = String(job.extension || '').toLowerCase();
+		const maxWidth = Number(job.max_width || 0);
+		const maxHeight = Number(job.max_height || 0);
 
-	image = resizeImage(image);
+		let image = sharp(job.input).autoOrient();
+		image = resizeImage(image, maxWidth, maxHeight);
 
-	if (mode === 'resize') {
-		image = encodeResizeOutput(
-			image,
-			ext
-		);
-	} else if (mode === 'optimize') {
-		image = encodeOptimizedOutput(
-			image,
-			ext
-		);
-	} else {
-		throw new Error(
-			`Unsupported processing mode: ${mode}`
-		);
+		if (job.mode === 'resize') {
+			image = encodeResizeOutput(image, ext);
+		} else if (job.mode === 'optimize') {
+			image = encodeOptimizedOutput(image, ext);
+		} else {
+			throw new Error(`Unsupported processing mode: ${job.mode}`);
+		}
+
+		await image.toFile(job.output);
+
+		return {
+			id: String(job.id),
+			success: true,
+		};
+	} catch (error) {
+		return {
+			id: String(job.id),
+			success: false,
+			error: error && error.message ? error.message : String(error),
+		};
 	}
-
-	await image.toFile(output);
 }
 
-processImage().catch((error) => {
-	console.error(
-		error && error.message
-			? error.message
-			: String(error)
+async function processWithConcurrency(jobs, concurrency) {
+	const results = new Array(jobs.length);
+	let nextIndex = 0;
+
+	async function worker() {
+		while (true) {
+			const index = nextIndex++;
+
+			if (index >= jobs.length) {
+				return;
+			}
+
+			results[index] = await processJob(jobs[index]);
+		}
+	}
+
+	const workerCount = Math.min(
+		Math.max(1, concurrency),
+		jobs.length || 1
 	);
 
+	await Promise.all(
+		Array.from({ length: workerCount }, () => worker())
+	);
+
+	return results;
+}
+
+async function main() {
+	const rawManifest = await fs.readFile(manifestPath, 'utf8');
+	const manifest = JSON.parse(rawManifest);
+	const jobs = Array.isArray(manifest.jobs) ? manifest.jobs : [];
+	const concurrency = Number(manifest.concurrency || 4);
+	const results = await processWithConcurrency(jobs, concurrency);
+
+	await fs.writeFile(
+		resultPath,
+		JSON.stringify(results),
+		'utf8'
+	);
+}
+
+main().catch((error) => {
+	console.error(error && error.message ? error.message : String(error));
 	process.exit(1);
 });

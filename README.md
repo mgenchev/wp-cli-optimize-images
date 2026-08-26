@@ -25,11 +25,14 @@ Original images are never modified. Optimized versions are written to a separate
 * Dry-run mode with no API requests or file changes
 * Automatically skip unchanged images
 * SHA-256 based optimization cache
-* Cache invalidation when resize settings change
+* Cache invalidation when processing settings change
 * Force re-optimization when required
 * Sync source and optimized directories
 * Remove optimized images whose source files no longer exist
 * Global TinyPNG API configuration
+* TinyPNG monthly usage reporting
+* Batch local image processing for improved performance
+* Concurrent TinyPNG requests for faster large batches
 * Status command for checking the current setup
 * Works independently of a specific WordPress installation
 
@@ -41,7 +44,7 @@ Actual compression depends on the source images. Images that are already optimiz
 
 * PHP 8.1+
 * WP-CLI
-* Node.js 20.9+ and npm for resizing and the free local optimizer
+* Node.js 20.9+ and npm for resizing and local optimization
 * PHP cURL extension when using TinyPNG
 * TinyPNG API key is optional
 
@@ -65,7 +68,7 @@ No WordPress installation is required to use the command.
 
 ## TinyPNG Configuration
 
-TinyPNG is optional, but it is used as the preferred optimization engine when configured.
+TinyPNG is optional, but it is used as the preferred optimization service when configured.
 
 Configure your TinyPNG API key:
 
@@ -90,6 +93,8 @@ The key is stored globally in:
 You only need to configure it once.
 
 If the `TINIFY_API_KEY` environment variable exists, it takes precedence over the stored configuration.
+
+TinyPNG currently includes **500 free compressions each calendar month**.
 
 If no TinyPNG API key is configured, the package automatically uses the free local optimizer.
 
@@ -138,7 +143,7 @@ wp optimize-images ./images --max-width=1920 --max-height=1920
 
 The image is resized proportionally so that it fits inside the specified bounds.
 
-For example:
+Examples:
 
 ```text
 4000 × 3000 → 1920 × 1440
@@ -155,42 +160,73 @@ wp optimize-images ./images --no-resize
 
 `--no-resize` cannot be combined with `--max-width` or `--max-height`.
 
-## Optimization Engines
+## Processing
 
-The package automatically chooses the appropriate optimization engine.
-
-When TinyPNG is configured:
+When TinyPNG is configured, images are processed as follows:
 
 ```text
+Source image
+    ↓
 Resize locally if required
     ↓
-TinyPNG
+TinyPNG compression
     ↓
-Success → use TinyPNG output
-
-API unavailable
-Compression limit reached
-Authentication/account issue
-    ↓
-Local Sharp/libvips fallback
+Optimized output
 ```
 
-When TinyPNG is not configured:
+If TinyPNG becomes unavailable, reaches the account limit, or encounters an account/API error, processing automatically continues using Sharp/libvips locally.
+
+If TinyPNG is not configured, the entire batch is processed locally.
+
+TinyPNG supports AVIF, WebP, JPEG and PNG images.
+
+Resize operations are performed locally rather than through the TinyPNG resize API, avoiding additional TinyPNG compression credits for resizing. TinyPNG's API counts each API-side resize as an additional compression.
+
+## Performance
+
+The command is optimized for processing image directories efficiently.
+
+### Batch Local Processing
+
+Sharp processing runs in batches instead of starting a separate Node.js process for every image.
+
+This significantly reduces process startup overhead when processing larger directories.
 
 ```text
-Sharp/libvips
+Before
+
+PHP
+ ↓
+Node → image 1
+Node → image 2
+Node → image 3
+Node → image 4
 ```
 
-The local optimizer is installed automatically when it is first required.
+Now:
 
-Supported local optimization includes:
+```text
+PHP
+ ↓
+Single Node process
+ ↓
+image 1
+image 2
+image 3
+image 4
+```
 
-* JPEG optimization
-* PNG palette and compression optimization
-* WebP optimization
-* AVIF optimization
+Multiple Sharp jobs can be processed concurrently inside the batch.
 
-If local optimization produces a larger file and the image was not resized, the original file is kept instead.
+### Concurrent TinyPNG Requests
+
+TinyPNG requests are also processed concurrently in small groups rather than waiting for every image to finish before starting the next one.
+
+The concurrency level is intentionally conservative to improve performance without aggressively hitting the TinyPNG API.
+
+Tinify recommends adding delay when API rate limits are reached, so the package avoids excessive parallel requests.
+
+The command currently processes up to **3 TinyPNG requests concurrently**.
 
 ## Status
 
@@ -281,11 +317,13 @@ Absolute paths are also supported:
 wp optimize-images ./images --output="D:\Output\optimized-images"
 ```
 
+The output directory cannot be located inside the source directory.
+
 ## Filter by File Extension
 
 By default, all supported image formats are processed.
 
-To process only specific extensions, provide a comma-separated list:
+To process only specific extensions:
 
 ```bash
 wp optimize-images ./images --extensions=jpg,png
@@ -300,7 +338,10 @@ wp optimize-images ./images --extensions=webp
 Options can be combined:
 
 ```bash
-wp optimize-images ./images --extensions=jpg,png --max-width=1920 --output=./dist/images
+wp optimize-images ./images \
+    --extensions=jpg,png \
+    --max-width=1920 \
+    --output=./dist/images
 ```
 
 ## Dry Run
@@ -359,7 +400,9 @@ When the command is run again, unchanged images are skipped:
 
 If an original image changes, it is automatically processed again.
 
-The cache also includes the current processing settings. For example, changing:
+The cache also tracks processing settings.
+
+For example, changing:
 
 ```bash
 --max-width=2880
@@ -373,6 +416,8 @@ to:
 
 causes the affected images to be processed again automatically.
 
+Performance-only package updates do not invalidate already optimized images unless the resulting optimization behavior changes.
+
 ## Force Optimization
 
 To ignore the cache and process every selected image again:
@@ -384,7 +429,10 @@ wp optimize-images /path/to/images --force
 You can combine `--force` with other options:
 
 ```bash
-wp optimize-images ./images --force --max-width=1920 --extensions=jpg,png
+wp optimize-images ./images \
+    --force \
+    --max-width=1920 \
+    --extensions=jpg,png
 ```
 
 ## Sync
@@ -399,9 +447,10 @@ Sync performs the following actions:
 
 * new source image → optimize
 * changed source image → re-optimize
-* changed resize settings → re-process
+* changed processing settings → re-process
 * unchanged source image → skip
 * deleted source image → remove corresponding optimized image
+* empty output directories → clean up
 
 Example:
 
@@ -470,7 +519,7 @@ Dry run
 Success: Dry run complete. No files were changed.
 ```
 
-## Final Summary
+## Summary
 
 After processing, the command displays a summary:
 
@@ -528,6 +577,9 @@ wp optimize-images ./images
 # Custom maximum width
 wp optimize-images ./images --max-width=1920
 
+# Custom maximum height
+wp optimize-images ./images --max-height=1600
+
 # Custom maximum dimensions
 wp optimize-images ./images --max-width=1920 --max-height=1920
 
@@ -552,17 +604,6 @@ wp optimize-images sync ./images
 # Preview synchronization
 wp optimize-images sync ./images --dry-run
 ```
-
-## Performance
-
-Image processing currently happens sequentially.
-
-Large batches can take some time because resizing and local optimization use Sharp through Node.js, while TinyPNG optimization also involves uploading and downloading each image.
-
-Future performance improvements may include:
-
-* batch Sharp processing
-* concurrent TinyPNG requests
 
 ## Updating
 
