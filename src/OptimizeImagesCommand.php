@@ -33,10 +33,23 @@ class Optimize_Images_Command {
 
 	private const CONFIG_FILENAME = 'optimize-images.json';
 	private const CACHE_FILENAME = '.optimize-images-cache.json';
+
 	private const LOCAL_RUNTIME_DIRNAME = 'optimize-images-local';
 	private const LOCAL_OPTIMIZER_FILENAME = 'local-optimizer.cjs';
+
 	private const SHARP_VERSION = '^0.35.0';
 	private const MINIMUM_NODE_VERSION = '20.9.0';
+
+	private const DEFAULT_MAX_WIDTH = 2880;
+	private const DEFAULT_MAX_HEIGHT = 2880;
+
+	private const TINIFY_FREE_MONTHLY_COMPRESSIONS = 500;
+
+	/**
+	 * Increment this whenever optimization behavior changes
+	 * in a way that should invalidate the existing cache.
+	 */
+	private const PROCESSING_VERSION = 2;
 
 	private $tinypng_disabled_for_run = false;
 	private $tinypng_fallback_notice_shown = false;
@@ -92,7 +105,7 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Configure the TinyPNG API key.
+	 * Configure TinyPNG.
 	 */
 	private function configure() {
 		\WP_CLI::log( 'TinyPNG API configuration' );
@@ -134,13 +147,13 @@ class Optimize_Images_Command {
 			JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES
 		);
 
-		if ( false === $json ) {
-			\WP_CLI::error(
-				'Could not encode configuration.'
-			);
-		}
-
-		if ( false === file_put_contents( $config_file, $json ) ) {
+		if (
+			false === $json
+			|| false === file_put_contents(
+				$config_file,
+				$json
+			)
+		) {
 			\WP_CLI::error(
 				'Could not save configuration.'
 			);
@@ -154,179 +167,15 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Install the free local Sharp fallback.
-	 */
-	private function install_local_optimizer() {
-		$node_version = $this->get_node_version();
-
-		if ( ! $node_version ) {
-			\WP_CLI::error(
-				'Node.js is required for the local optimizer.'
-			);
-		}
-
-		if (
-			version_compare(
-				$node_version,
-				self::MINIMUM_NODE_VERSION,
-				'<'
-			)
-		) {
-			\WP_CLI::error(
-				sprintf(
-					'Node.js %s+ is required. Current version: %s',
-					self::MINIMUM_NODE_VERSION,
-					$node_version
-				)
-			);
-		}
-
-		if ( ! $this->command_exists( 'npm' ) ) {
-			\WP_CLI::error(
-				'npm is required for the local optimizer.'
-			);
-		}
-
-		$runtime_dir = $this->get_local_runtime_dir();
-
-		if (
-			! is_dir( $runtime_dir )
-			&& ! mkdir( $runtime_dir, 0755, true )
-		) {
-			\WP_CLI::error(
-				'Could not create the local optimizer directory.'
-			);
-		}
-
-		$source_script = dirname( __DIR__ )
-			. DIRECTORY_SEPARATOR
-			. 'resources'
-			. DIRECTORY_SEPARATOR
-			. self::LOCAL_OPTIMIZER_FILENAME;
-
-		$target_script = $this->get_local_optimizer_script();
-
-		if ( ! file_exists( $source_script ) ) {
-			\WP_CLI::error(
-				'Local optimizer script is missing from the package.'
-			);
-		}
-
-		if ( ! copy( $source_script, $target_script ) ) {
-			\WP_CLI::error(
-				'Could not install the local optimizer script.'
-			);
-		}
-
-		$package_json = [
-			'name' => 'wp-cli-optimize-images-local-runtime',
-			'private' => true,
-			'dependencies' => [
-				'sharp' => self::SHARP_VERSION,
-			],
-		];
-
-		$package_json_path = $runtime_dir
-			. DIRECTORY_SEPARATOR
-			. 'package.json';
-
-		$json = json_encode(
-			$package_json,
-			JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES
-		);
-
-		if (
-			false === $json
-			|| false === file_put_contents(
-				$package_json_path,
-				$json
-			)
-		) {
-			\WP_CLI::error(
-				'Could not create the local optimizer package.json.'
-			);
-		}
-
-		\WP_CLI::log(
-			'Installing local image optimizer...'
-		);
-
-		$original_dir = getcwd();
-
-		if ( ! chdir( $runtime_dir ) ) {
-			\WP_CLI::error(
-				'Could not enter the local optimizer directory.'
-			);
-		}
-
-		$npm_command = '\\' === DIRECTORY_SEPARATOR
-			? 'npm.cmd'
-			: 'npm';
-
-		$command = sprintf(
-			'%s install --omit=dev --no-audit --no-fund 2>&1',
-			$npm_command
-		);
-
-		$output = [];
-		$status = 0;
-
-		try {
-			exec(
-				$command,
-				$output,
-				$status
-			);
-		} finally {
-			if ( $original_dir ) {
-				chdir( $original_dir );
-			}
-		}
-
-		if (
-			0 !== $status
-			|| ! $this->is_local_optimizer_ready()
-		) {
-			$message = ! empty( $output )
-				? implode( PHP_EOL, $output )
-				: 'npm install failed.';
-
-			\WP_CLI::error(
-				"Could not install the local optimizer.\n{$message}"
-			);
-		}
-
-		\WP_CLI::success(
-			sprintf(
-				'Local optimizer installed. Sharp %s is ready.',
-				$this->get_sharp_version() ?: 'unknown'
-			)
-		);
-	}
-
-	/**
-	 * Ensure the local fallback optimizer is available.
-	 */
-	private function ensure_local_optimizer() {
-		if ( $this->is_local_optimizer_ready() ) {
-			return true;
-		}
-
-		\WP_CLI::log(
-			'Local optimizer is not installed. Setting it up automatically...'
-		);
-
-		$this->install_local_optimizer();
-
-		return $this->is_local_optimizer_ready();
-	}
-
-	/**
 	 * Display package status.
 	 */
 	private function status() {
 		$config_file = $this->get_config_file();
-		$environment_key = getenv( 'TINIFY_API_KEY' );
+
+		$environment_key = getenv(
+			'TINIFY_API_KEY'
+		);
+
 		$stored_key = $this->get_stored_api_key();
 		$node_version = $this->get_node_version();
 		$local_ready = $this->is_local_optimizer_ready();
@@ -341,7 +190,10 @@ class Optimize_Images_Command {
 
 		\WP_CLI::log( 'WP-CLI Optimize Images' );
 		\WP_CLI::log( '' );
-		\WP_CLI::log( 'PHP: ' . PHP_VERSION );
+
+		\WP_CLI::log(
+			'PHP: ' . PHP_VERSION
+		);
 
 		\WP_CLI::log(
 			'cURL: '
@@ -352,8 +204,9 @@ class Optimize_Images_Command {
 			)
 		);
 
-		\WP_CLI::log( 'TinyPNG API key: ' . $key_status );
-		\WP_CLI::log( 'Config: ' . $config_file );
+		\WP_CLI::log(
+			'TinyPNG API key: ' . $key_status
+		);
 
 		\WP_CLI::log(
 			'Node.js: '
@@ -365,74 +218,92 @@ class Optimize_Images_Command {
 		);
 
 		\WP_CLI::log(
-			'Local fallback: '
+			'Local optimizer: '
 			. (
 				$local_ready
-					? 'ready (Sharp ' . ( $this->get_sharp_version() ?: 'unknown' ) . ')'
+					? 'ready'
 					: 'not installed'
 			)
 		);
 
 		\WP_CLI::log(
+			sprintf(
+				'Default resize: %d × %d px',
+				self::DEFAULT_MAX_WIDTH,
+				self::DEFAULT_MAX_HEIGHT
+			)
+		);
+
+		\WP_CLI::log(
 			'Supported extensions: '
-			. implode( ', ', self::SUPPORTED_EXTENSIONS )
+			. implode(
+				', ',
+				self::SUPPORTED_EXTENSIONS
+			)
+		);
+
+		\WP_CLI::log(
+			'Config: ' . $config_file
 		);
 
 		\WP_CLI::log( '' );
 
-		if ( $stored_key || $environment_key ) {
-			if ( $local_ready ) {
-				\WP_CLI::log( 'Strategy: TinyPNG -> local fallback' );
-			} else {
-				\WP_CLI::log( 'Strategy: TinyPNG only' );
-				\WP_CLI::log(
-					'Run `wp optimize-images setup-local` to enable free fallback.'
-				);
-			}
-		} elseif ( $local_ready ) {
-			\WP_CLI::log( 'Strategy: local optimizer' );
-		} else {
-			\WP_CLI::log( 'Strategy: unavailable' );
-		}
-
-		\WP_CLI::log( '' );
-
 		if (
-			( $stored_key || $environment_key )
-			&& function_exists( 'curl_init' )
+			$environment_key
+			|| $stored_key
+			|| $local_ready
+			|| (
+				$node_version
+				&& $this->command_exists( 'npm' )
+			)
 		) {
-			\WP_CLI::success( 'Ready.' );
-
-			return;
-		}
-
-		if ( $local_ready ) {
-			\WP_CLI::success( 'Ready with local optimizer.' );
+			\WP_CLI::success(
+				'Ready.'
+			);
 
 			return;
 		}
 
 		\WP_CLI::warning(
-			'Set up TinyPNG or run: wp optimize-images setup-local'
+			'Node.js and npm are required when TinyPNG is not available.'
 		);
 	}
 
 	/**
 	 * Optimize an image directory.
 	 */
-	private function optimize( $directory, $assoc_args, $sync ) {
-		$source_dir = realpath( $directory );
+	private function optimize(
+		$directory,
+		$assoc_args,
+		$sync
+	) {
+		$source_dir = realpath(
+			$directory
+		);
 
-		if ( ! $source_dir || ! is_dir( $source_dir ) ) {
+		if (
+			! $source_dir
+			|| ! is_dir( $source_dir )
+		) {
 			\WP_CLI::error(
 				'Directory does not exist.'
 			);
 		}
 
-		$source_dir = $this->normalize_path( $source_dir );
+		$source_dir = $this->normalize_path(
+			$source_dir
+		);
 
 		$extensions = $this->get_extensions(
 			$assoc_args['extensions'] ?? null
+		);
+
+		$resize_settings = $this->get_resize_settings(
+			$assoc_args
+		);
+
+		$optimization_signature = $this->get_optimization_signature(
+			$resize_settings
 		);
 
 		$target_dir = $this->get_target_dir(
@@ -440,20 +311,32 @@ class Optimize_Images_Command {
 			$assoc_args['output'] ?? null
 		);
 
-		if ( $this->is_same_or_child_path( $target_dir, $source_dir ) ) {
+		if (
+			$this->is_same_or_child_path(
+				$target_dir,
+				$source_dir
+			)
+		) {
 			\WP_CLI::error(
 				'The output directory cannot be inside the input directory.'
 			);
 		}
 
-		$dry_run = isset( $assoc_args['dry-run'] );
-		$force = isset( $assoc_args['force'] );
+		$dry_run = isset(
+			$assoc_args['dry-run']
+		);
+
+		$force = isset(
+			$assoc_args['force']
+		);
 
 		$cache_file = $target_dir
 			. '/'
 			. self::CACHE_FILENAME;
 
-		$cache = $this->load_cache( $cache_file );
+		$cache = $this->load_cache(
+			$cache_file
+		);
 
 		$source_files = $this->collect_source_files(
 			$source_dir,
@@ -478,6 +361,8 @@ class Optimize_Images_Command {
 				$stale_files,
 				$cache,
 				$extensions,
+				$resize_settings,
+				$optimization_signature,
 				$force,
 				$sync
 			);
@@ -486,14 +371,12 @@ class Optimize_Images_Command {
 		}
 
 		$api_key = $this->get_api_key();
-
 		$local_ready = $this->is_local_optimizer_ready();
 
-		if ( ! $local_ready ) {
-			$local_ready = $this->ensure_local_optimizer();
-		}
-
-		if ( $api_key && ! function_exists( 'curl_init' ) ) {
+		if (
+			$api_key
+			&& ! function_exists( 'curl_init' )
+		) {
 			\WP_CLI::warning(
 				'PHP cURL is unavailable. TinyPNG will be skipped.'
 			);
@@ -501,41 +384,64 @@ class Optimize_Images_Command {
 			$api_key = null;
 		}
 
-		if ( ! $api_key && ! $local_ready ) {
-			\WP_CLI::error(
-				'No TinyPNG API key is configured and the local optimizer is not installed. Run: wp optimize-images setup-local'
-			);
+		if (
+			! $api_key
+			&& ! $local_ready
+		) {
+			$local_ready = $this->ensure_local_optimizer();
 		}
 
-		if ( $api_key && ! $local_ready ) {
-			\WP_CLI::warning(
-				'Local fallback is not installed. Run `wp optimize-images setup-local` to enable automatic fallback.'
+		if (
+			! $api_key
+			&& ! $local_ready
+		) {
+			\WP_CLI::error(
+				'No image optimization engine is available.'
 			);
 		}
 
 		if (
 			! is_dir( $target_dir )
-			&& ! mkdir( $target_dir, 0755, true )
+			&& ! mkdir(
+				$target_dir,
+				0755,
+				true
+			)
 		) {
 			\WP_CLI::error(
 				'Could not create output directory.'
 			);
 		}
 
-		\WP_CLI::log( "Source: {$source_dir}" );
-		\WP_CLI::log( "Output: {$target_dir}" );
 		\WP_CLI::log(
-			'Extensions: '
-			. implode( ',', $extensions )
+			"Source: {$source_dir}"
 		);
 
 		\WP_CLI::log(
-			'Engine: '
-			. $this->get_engine_strategy_label(
-				$api_key,
-				$local_ready
+			"Output: {$target_dir}"
+		);
+
+		\WP_CLI::log(
+			'Extensions: '
+			. implode(
+				',',
+				$extensions
 			)
 		);
+
+		if ( $resize_settings['enabled'] ) {
+			\WP_CLI::log(
+				sprintf(
+					'Resize: max %d × %d px',
+					$resize_settings['max_width'],
+					$resize_settings['max_height']
+				)
+			);
+		} else {
+			\WP_CLI::log(
+				'Resize: disabled'
+			);
+		}
 
 		\WP_CLI::log( '' );
 
@@ -564,33 +470,33 @@ class Optimize_Images_Command {
 		}
 
 		$optimized = 0;
+		$resized = 0;
 		$skipped = 0;
 		$failed = 0;
+
 		$original_size = 0;
 		$output_size = 0;
 
-		$engine_counts = [
-			'tinypng' => 0,
-			'local' => 0,
-		];
-
-		foreach ( $source_files as $cache_key => $file ) {
+		foreach (
+			$source_files
+				as $cache_key => $file
+		) {
 			$source_file = $file['source'];
 			$relative = $file['relative'];
+			$source_hash = $file['hash'];
 
 			$target_file = $target_dir
 				. '/'
 				. $relative;
 
-			$source_hash = $file['hash'];
-
 			if (
 				! $force
 				&& file_exists( $target_file )
 				&& isset( $cache[ $cache_key ] )
-				&& $this->cache_hash_matches(
+				&& $this->cache_matches(
 					$cache[ $cache_key ],
-					$source_hash
+					$source_hash,
+					$optimization_signature
 				)
 			) {
 				\WP_CLI::log(
@@ -627,13 +533,27 @@ class Optimize_Images_Command {
 				$source_file
 			);
 
+			$will_resize = $this->should_resize(
+				$file,
+				$resize_settings
+			);
+
+			$target_dimensions = $will_resize
+				? $this->get_target_dimensions(
+					$file,
+					$resize_settings
+				)
+				: null;
+
 			try {
 				$engine = $this->optimize_image_with_fallback(
 					$source_file,
 					$target_file,
 					$file['extension'],
 					$api_key,
-					$relative
+					$relative,
+					$resize_settings,
+					$will_resize
 				);
 
 				$after = filesize(
@@ -647,13 +567,17 @@ class Optimize_Images_Command {
 
 				$original_size += $before;
 				$output_size += $after;
+
 				$optimized++;
 
-				$engine_counts[ $engine ]++;
+				if ( $will_resize ) {
+					$resized++;
+				}
 
 				$cache[ $cache_key ] = [
 					'hash' => $source_hash,
 					'engine' => $engine,
+					'signature' => $optimization_signature,
 				];
 
 				$this->save_cache(
@@ -661,11 +585,26 @@ class Optimize_Images_Command {
 					$cache
 				);
 
+				$resize_label = '';
+
+				if (
+					$will_resize
+					&& $target_dimensions
+				) {
+					$resize_label = sprintf(
+						' [%d×%d → %d×%d]',
+						$file['width'],
+						$file['height'],
+						$target_dimensions['width'],
+						$target_dimensions['height']
+					);
+				}
+
 				\WP_CLI::log(
 					sprintf(
-						'✓ %s [%s]  %s → %s (-%s)',
+						'✓ %s%s  %s → %s (-%s)',
 						$relative,
-						$this->format_engine_name( $engine ),
+						$resize_label,
 						$this->format_bytes( $before ),
 						$this->format_bytes( $after ),
 						$before > 0
@@ -684,85 +623,74 @@ class Optimize_Images_Command {
 			}
 		}
 
-		\WP_CLI::log( '' );
-
-		$total_saved = max(
-			0,
-			$original_size - $output_size
-		);
-
-		$saved_percent = $original_size > 0
-			? round(
-				( $total_saved / $original_size ) * 100
-			)
-			: 0;
-
-		$message = sprintf(
-			'Optimized: %d | Skipped: %d | Failed: %d',
+		$this->print_summary(
+			count( $source_files ),
 			$optimized,
+			$resized,
 			$skipped,
-			$failed
+			$failed,
+			$removed,
+			$original_size,
+			$output_size,
+			$sync
 		);
-
-		if ( $sync ) {
-			$message .= sprintf(
-				' | Removed: %d',
-				$removed
-			);
-		}
-
-		$message .= sprintf(
-			' | Saved: %s (%d%%)',
-			$this->format_bytes( $total_saved ),
-			$saved_percent
-		);
-
-		\WP_CLI::success(
-			$message
-		);
-
-		if ( $optimized > 0 ) {
-			\WP_CLI::log(
-				sprintf(
-					'Engines: TinyPNG %d | Local %d',
-					$engine_counts['tinypng'],
-					$engine_counts['local']
-				)
-			);
-		}
-
-		if ( null !== $this->tinypng_compression_count ) {
-			\WP_CLI::log(
-				'TinyPNG compressions this month: '
-				. $this->tinypng_compression_count
-			);
-		}
 	}
 
 	/**
-	 * Optimize with TinyPNG first and automatically fall back locally.
+	 * Optimize with TinyPNG and fall back locally when needed.
 	 */
 	private function optimize_image_with_fallback(
 		$source,
 		$target,
 		$extension,
 		$api_key,
-		$relative
+		$relative,
+		$resize_settings,
+		$will_resize
 	) {
 		if (
 			$api_key
 			&& ! $this->tinypng_disabled_for_run
 		) {
+			$tinypng_source = $source;
+			$temp_source = null;
+
 			try {
+				if ( $will_resize ) {
+					$temp_source = $this->create_resized_temporary_image(
+						$source,
+						$extension,
+						$resize_settings
+					);
+
+					$tinypng_source = $temp_source;
+				}
+
 				$this->optimize_image_tinypng(
-					$source,
+					$tinypng_source,
 					$target,
 					$api_key
 				);
 
+				if (
+					$temp_source
+					&& file_exists( $temp_source )
+				) {
+					@unlink( $temp_source );
+				}
+
 				return 'tinypng';
 			} catch ( Tiny_Png_Optimization_Exception $e ) {
-				if ( $e->should_disable_for_run() ) {
+				if (
+					$temp_source
+					&& file_exists( $temp_source )
+				) {
+					@unlink( $temp_source );
+				}
+
+				if (
+					$e->should_disable_for_run()
+				) {
 					$this->tinypng_disabled_for_run = true;
 
 					if (
@@ -771,7 +699,7 @@ class Optimize_Images_Command {
 						\WP_CLI::warning(
 							'TinyPNG is unavailable ('
 							. $e->getMessage()
-							. '). Switching to the free local optimizer for the remaining images.'
+							. '). Switching to the free local optimizer.'
 						);
 
 						$this->tinypng_fallback_notice_shown = true;
@@ -784,11 +712,9 @@ class Optimize_Images_Command {
 			}
 		}
 
-		if ( ! $this->is_local_optimizer_ready() ) {
-			$this->ensure_local_optimizer();
-		}
-
-		if ( ! $this->is_local_optimizer_ready() ) {
+		if (
+			! $this->ensure_local_optimizer()
+		) {
 			throw new \RuntimeException(
 				'Could not initialize the local optimizer.'
 			);
@@ -797,14 +723,62 @@ class Optimize_Images_Command {
 		$this->optimize_image_local(
 			$source,
 			$target,
-			$extension
+			$extension,
+			$resize_settings
 		);
 
 		return 'local';
 	}
 
 	/**
-	 * Optimize an image through TinyPNG.
+	 * Create a resized high-quality intermediate image
+	 * before passing it to TinyPNG.
+	 */
+	private function create_resized_temporary_image(
+		$source,
+		$extension,
+		$resize_settings
+	) {
+		if (
+			! $this->ensure_local_optimizer()
+		) {
+			throw new \RuntimeException(
+				'Could not initialize the local image resizer.'
+			);
+		}
+
+		$temp_file = tempnam(
+			sys_get_temp_dir(),
+			'wp-optimize-'
+		);
+
+		if ( false === $temp_file ) {
+			throw new \RuntimeException(
+				'Could not create temporary image.'
+			);
+		}
+
+		@unlink( $temp_file );
+
+		$this->run_local_optimizer(
+			'resize',
+			$source,
+			$temp_file,
+			$extension,
+			$resize_settings
+		);
+
+		if ( ! file_exists( $temp_file ) ) {
+			throw new \RuntimeException(
+				'Could not create resized temporary image.'
+			);
+		}
+
+		return $temp_file;
+	}
+
+	/**
+	 * Optimize an image using TinyPNG.
 	 */
 	private function optimize_image_tinypng(
 		$source,
@@ -834,7 +808,7 @@ class Optimize_Images_Command {
 			curl_close( $ch );
 
 			throw new Tiny_Png_Optimization_Exception(
-				$error ?: 'Connection error',
+				$error ?: 'Connection error.',
 				true
 			);
 		}
@@ -961,11 +935,15 @@ class Optimize_Images_Command {
 			throw new Tiny_Png_Optimization_Exception(
 				'Could not download optimized image.',
 				$status >= 500
-				|| in_array(
-					$status,
-					[ 401, 403, 429 ],
-					true
-				)
+					|| in_array(
+						$status,
+						[
+							401,
+							403,
+							429,
+						],
+						true
+					)
 			);
 		}
 
@@ -982,12 +960,13 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Optimize an image using the local Sharp runtime.
+	 * Optimize an image locally.
 	 */
 	private function optimize_image_local(
 		$source,
 		$target,
-		$extension
+		$extension,
+		$resize_settings
 	) {
 		$temp_target = $target
 			. '.tmp-'
@@ -995,41 +974,17 @@ class Optimize_Images_Command {
 				random_bytes( 6 )
 			);
 
-		$script = $this->get_local_optimizer_script();
-
-		$command = sprintf(
-			'node %s %s %s %s 2>&1',
-			escapeshellarg( $script ),
-			escapeshellarg( $source ),
-			escapeshellarg( $temp_target ),
-			escapeshellarg( $extension )
+		$this->run_local_optimizer(
+			'optimize',
+			$source,
+			$temp_target,
+			$extension,
+			$resize_settings
 		);
 
-		$output = [];
-		$status = 0;
-
-		exec(
-			$command,
-			$output,
-			$status
-		);
-
-		if (
-			0 !== $status
-			|| ! file_exists( $temp_target )
-		) {
-			if ( file_exists( $temp_target ) ) {
-				@unlink( $temp_target );
-			}
-
-			$message = ! empty( $output )
-				? trim(
-					implode( ' ', $output )
-				)
-				: 'Local optimization failed.';
-
+		if ( ! file_exists( $temp_target ) ) {
 			throw new \RuntimeException(
-				$message
+				'Local optimization failed.'
 			);
 		}
 
@@ -1049,11 +1004,21 @@ class Optimize_Images_Command {
 			);
 		}
 
-		// Never replace the source with a larger optimized file.
-		if ( $optimized_size >= $source_size ) {
+		if (
+			$optimized_size >= $source_size
+			&& ! $this->should_force_resized_output(
+				$source,
+				$resize_settings
+			)
+		) {
 			@unlink( $temp_target );
 
-			if ( ! copy( $source, $target ) ) {
+			if (
+				! copy(
+					$source,
+					$target
+				)
+			) {
 				throw new \RuntimeException(
 					'Could not save local optimizer output.'
 				);
@@ -1073,7 +1038,12 @@ class Optimize_Images_Command {
 			);
 		}
 
-		if ( ! rename( $temp_target, $target ) ) {
+		if (
+			! rename(
+				$temp_target,
+				$target
+			)
+		) {
 			if (
 				! copy(
 					$temp_target,
@@ -1092,7 +1062,521 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Decide whether TinyPNG should be disabled for the rest of this run.
+	 * Execute the local Sharp script.
+	 */
+	private function run_local_optimizer(
+		$mode,
+		$source,
+		$target,
+		$extension,
+		$resize_settings
+	) {
+		if (
+			! $this->ensure_local_optimizer()
+		) {
+			throw new \RuntimeException(
+				'Could not initialize the local optimizer.'
+			);
+		}
+
+		$max_width = $resize_settings['enabled']
+			? $resize_settings['max_width']
+			: 0;
+
+		$max_height = $resize_settings['enabled']
+			? $resize_settings['max_height']
+			: 0;
+
+		$command = sprintf(
+			'node %s %s %s %s %s %d %d 2>&1',
+			escapeshellarg(
+				$this->get_local_optimizer_script()
+			),
+			escapeshellarg( $mode ),
+			escapeshellarg( $source ),
+			escapeshellarg( $target ),
+			escapeshellarg( $extension ),
+			$max_width,
+			$max_height
+		);
+
+		$output = [];
+		$status = 0;
+
+		exec(
+			$command,
+			$output,
+			$status
+		);
+
+		if ( 0 !== $status ) {
+			$message = ! empty( $output )
+				? trim(
+					implode(
+						' ',
+						$output
+					)
+				)
+				: 'Local image processing failed.';
+
+			if ( file_exists( $target ) ) {
+				@unlink( $target );
+			}
+
+			throw new \RuntimeException(
+				$message
+			);
+		}
+	}
+
+	/**
+	 * Check whether a larger local output should still
+	 * be kept because the dimensions were reduced.
+	 */
+	private function should_force_resized_output(
+		$source,
+		$resize_settings
+	) {
+		if ( ! $resize_settings['enabled'] ) {
+			return false;
+		}
+
+		$dimensions = $this->get_image_dimensions(
+			$source
+		);
+
+		if ( ! $dimensions ) {
+			return false;
+		}
+
+		return $dimensions['width']
+			> $resize_settings['max_width']
+			|| $dimensions['height']
+			> $resize_settings['max_height'];
+	}
+
+	/**
+	 * Parse resize settings.
+	 */
+	private function get_resize_settings(
+		$assoc_args
+	) {
+		$no_resize = isset(
+			$assoc_args['no-resize']
+		);
+
+		if (
+			$no_resize
+			&& (
+				isset( $assoc_args['max-width'] )
+				|| isset( $assoc_args['max-height'] )
+			)
+		) {
+			\WP_CLI::error(
+				'--no-resize cannot be combined with --max-width or --max-height.'
+			);
+		}
+
+		if ( $no_resize ) {
+			return [
+				'enabled' => false,
+				'max_width' => null,
+				'max_height' => null,
+			];
+		}
+
+		$max_width = $this->parse_dimension_option(
+			$assoc_args['max-width'] ?? null,
+			self::DEFAULT_MAX_WIDTH,
+			'max-width'
+		);
+
+		$max_height = $this->parse_dimension_option(
+			$assoc_args['max-height'] ?? null,
+			self::DEFAULT_MAX_HEIGHT,
+			'max-height'
+		);
+
+		return [
+			'enabled' => true,
+			'max_width' => $max_width,
+			'max_height' => $max_height,
+		];
+	}
+
+	/**
+	 * Validate a dimension CLI option.
+	 */
+	private function parse_dimension_option(
+		$value,
+		$default,
+		$name
+	) {
+		if (
+			null === $value
+			|| '' === $value
+		) {
+			return $default;
+		}
+
+		if (
+			! ctype_digit(
+				(string) $value
+			)
+			|| (int) $value < 1
+		) {
+			\WP_CLI::error(
+				"--{$name} must be a positive integer."
+			);
+		}
+
+		return (int) $value;
+	}
+
+	/**
+	 * Get image dimensions.
+	 */
+	private function get_image_dimensions(
+		$source
+	) {
+		$dimensions = @getimagesize(
+			$source
+		);
+
+		if (
+			false === $dimensions
+			|| empty( $dimensions[0] )
+			|| empty( $dimensions[1] )
+		) {
+			return null;
+		}
+
+		return [
+			'width' => (int) $dimensions[0],
+			'height' => (int) $dimensions[1],
+		];
+	}
+
+	/**
+	 * Check whether an image needs resizing.
+	 */
+	private function should_resize(
+		$file,
+		$resize_settings
+	) {
+		if (
+			! $resize_settings['enabled']
+			|| empty( $file['width'] )
+			|| empty( $file['height'] )
+		) {
+			return false;
+		}
+
+		return $file['width']
+			> $resize_settings['max_width']
+			|| $file['height']
+			> $resize_settings['max_height'];
+	}
+
+	/**
+	 * Calculate proportional target dimensions.
+	 */
+	private function get_target_dimensions(
+		$file,
+		$resize_settings
+	) {
+		if (
+			empty( $file['width'] )
+			|| empty( $file['height'] )
+		) {
+			return null;
+		}
+
+		$ratio = min(
+			$resize_settings['max_width']
+				/ $file['width'],
+			$resize_settings['max_height']
+				/ $file['height'],
+			1
+		);
+
+		return [
+			'width' => max(
+				1,
+				(int) round(
+					$file['width'] * $ratio
+				)
+			),
+			'height' => max(
+				1,
+				(int) round(
+					$file['height'] * $ratio
+				)
+			),
+		];
+	}
+
+	/**
+	 * Generate the cache signature for the current settings.
+	 */
+	private function get_optimization_signature(
+		$resize_settings
+	) {
+		if ( ! $resize_settings['enabled'] ) {
+			return sprintf(
+				'v%d|resize:none',
+				self::PROCESSING_VERSION
+			);
+		}
+
+		return sprintf(
+			'v%d|resize:%dx%d',
+			self::PROCESSING_VERSION,
+			$resize_settings['max_width'],
+			$resize_settings['max_height']
+		);
+	}
+
+	/**
+	 * Check a cache entry.
+	 */
+	private function cache_matches(
+		$cache_entry,
+		$source_hash,
+		$optimization_signature
+	) {
+		if ( ! is_array( $cache_entry ) ) {
+			return false;
+		}
+
+		if (
+			empty( $cache_entry['hash'] )
+			|| empty( $cache_entry['signature'] )
+		) {
+			return false;
+		}
+
+		return hash_equals(
+			$cache_entry['hash'],
+			$source_hash
+		)
+			&& hash_equals(
+				$cache_entry['signature'],
+				$optimization_signature
+			);
+	}
+
+	/**
+	 * Ensure the local optimizer is available.
+	 */
+	private function ensure_local_optimizer() {
+		if (
+			$this->is_local_optimizer_ready()
+		) {
+			$this->sync_local_optimizer_script();
+
+			return true;
+		}
+
+		\WP_CLI::log(
+			'Local optimizer is not installed. Setting it up automatically...'
+		);
+
+		$this->install_local_optimizer();
+
+		return $this->is_local_optimizer_ready();
+	}
+
+	/**
+	 * Keep the runtime script synchronized after package updates.
+	 */
+	private function sync_local_optimizer_script() {
+		$source_script = dirname( __DIR__ )
+			. DIRECTORY_SEPARATOR
+			. 'resources'
+			. DIRECTORY_SEPARATOR
+			. self::LOCAL_OPTIMIZER_FILENAME;
+
+		$target_script = $this->get_local_optimizer_script();
+
+		if ( ! file_exists( $source_script ) ) {
+			throw new \RuntimeException(
+				'Local optimizer script is missing from the package.'
+			);
+		}
+
+		$needs_copy = ! file_exists(
+			$target_script
+		);
+
+		if (
+			! $needs_copy
+			&& hash_file( 'sha256', $source_script )
+				!== hash_file( 'sha256', $target_script )
+		) {
+			$needs_copy = true;
+		}
+
+		if (
+			$needs_copy
+			&& ! copy(
+				$source_script,
+				$target_script
+			)
+		) {
+			throw new \RuntimeException(
+				'Could not update the local optimizer script.'
+			);
+		}
+	}
+
+	/**
+	 * Install Sharp locally.
+	 */
+	private function install_local_optimizer() {
+		$node_version = $this->get_node_version();
+
+		if ( ! $node_version ) {
+			\WP_CLI::error(
+				'Node.js is required for the local optimizer.'
+			);
+		}
+
+		if (
+			version_compare(
+				$node_version,
+				self::MINIMUM_NODE_VERSION,
+				'<'
+			)
+		) {
+			\WP_CLI::error(
+				sprintf(
+					'Node.js %s+ is required. Current version: %s',
+					self::MINIMUM_NODE_VERSION,
+					$node_version
+				)
+			);
+		}
+
+		if (
+			! $this->command_exists( 'npm' )
+		) {
+			\WP_CLI::error(
+				'npm is required for the local optimizer.'
+			);
+		}
+
+		$runtime_dir = $this->get_local_runtime_dir();
+
+		if (
+			! is_dir( $runtime_dir )
+			&& ! mkdir(
+				$runtime_dir,
+				0755,
+				true
+			)
+		) {
+			\WP_CLI::error(
+				'Could not create the local optimizer directory.'
+			);
+		}
+
+		$this->sync_local_optimizer_script();
+
+		$package_json = [
+			'name' => 'wp-cli-optimize-images-local-runtime',
+			'private' => true,
+			'dependencies' => [
+				'sharp' => self::SHARP_VERSION,
+			],
+		];
+
+		$json = json_encode(
+			$package_json,
+			JSON_PRETTY_PRINT
+				| JSON_UNESCAPED_SLASHES
+		);
+
+		$package_json_path = $runtime_dir
+			. DIRECTORY_SEPARATOR
+			. 'package.json';
+
+		if (
+			false === $json
+			|| false === file_put_contents(
+				$package_json_path,
+				$json
+			)
+		) {
+			\WP_CLI::error(
+				'Could not create the local optimizer package.json.'
+			);
+		}
+
+		\WP_CLI::log(
+			'Installing local image optimizer...'
+		);
+
+		$original_dir = getcwd();
+
+		if (
+			! chdir( $runtime_dir )
+		) {
+			\WP_CLI::error(
+				'Could not enter the local optimizer directory.'
+			);
+		}
+
+		$npm_command = '\\' === DIRECTORY_SEPARATOR
+			? 'npm.cmd'
+			: 'npm';
+
+		$command = sprintf(
+			'%s install --omit=dev --no-audit --no-fund 2>&1',
+			$npm_command
+		);
+
+		$output = [];
+		$status = 0;
+
+		try {
+			exec(
+				$command,
+				$output,
+				$status
+			);
+		} finally {
+			if ( $original_dir ) {
+				chdir(
+					$original_dir
+				);
+			}
+		}
+
+		if (
+			0 !== $status
+			|| ! $this->is_local_optimizer_ready()
+		) {
+			$message = ! empty( $output )
+				? implode(
+					PHP_EOL,
+					$output
+				)
+				: 'npm install failed.';
+
+			\WP_CLI::error(
+				"Could not install the local optimizer.\n{$message}"
+			);
+		}
+
+		\WP_CLI::success(
+			'Local optimizer installed.'
+		);
+	}
+
+	/**
+	 * Determine whether TinyPNG should be disabled
+	 * for the remainder of this run.
 	 */
 	private function is_global_tinypng_failure(
 		$status,
@@ -1102,7 +1586,11 @@ class Optimize_Images_Command {
 		if (
 			in_array(
 				$status,
-				[ 401, 403, 429 ],
+				[
+					401,
+					403,
+					429,
+				],
 				true
 			)
 			|| $status >= 500
@@ -1144,7 +1632,7 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Capture monthly TinyPNG usage from response headers.
+	 * Capture TinyPNG usage.
 	 */
 	private function capture_tinypng_compression_count(
 		$headers
@@ -1161,7 +1649,7 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Run without modifying files or calling TinyPNG.
+	 * Dry-run output.
 	 */
 	private function run_dry_run(
 		$source_dir,
@@ -1170,12 +1658,11 @@ class Optimize_Images_Command {
 		$stale_files,
 		$cache,
 		$extensions,
+		$resize_settings,
+		$optimization_signature,
 		$force,
 		$sync
 	) {
-		$api_key = $this->get_api_key();
-		$local_ready = $this->is_local_optimizer_ready();
-
 		\WP_CLI::log(
 			"Source: {$source_dir}"
 		);
@@ -1186,16 +1673,25 @@ class Optimize_Images_Command {
 
 		\WP_CLI::log(
 			'Extensions: '
-			. implode( ',', $extensions )
-		);
-
-		\WP_CLI::log(
-			'Engine: '
-			. $this->get_engine_strategy_label(
-				$api_key,
-				$local_ready
+			. implode(
+				',',
+				$extensions
 			)
 		);
+
+		if ( $resize_settings['enabled'] ) {
+			\WP_CLI::log(
+				sprintf(
+					'Resize: max %d × %d px',
+					$resize_settings['max_width'],
+					$resize_settings['max_height']
+				)
+			);
+		} else {
+			\WP_CLI::log(
+				'Resize: disabled'
+			);
+		}
 
 		\WP_CLI::log(
 			'Mode: dry-run'
@@ -1204,10 +1700,14 @@ class Optimize_Images_Command {
 		\WP_CLI::log( '' );
 
 		$would_optimize = 0;
+		$would_resize = 0;
 		$unchanged = 0;
 		$total_size = 0;
 
-		foreach ( $source_files as $cache_key => $file ) {
+		foreach (
+			$source_files
+				as $cache_key => $file
+		) {
 			$target_file = $target_dir
 				. '/'
 				. $file['relative'];
@@ -1218,9 +1718,10 @@ class Optimize_Images_Command {
 				! $force
 				&& file_exists( $target_file )
 				&& isset( $cache[ $cache_key ] )
-				&& $this->cache_hash_matches(
+				&& $this->cache_matches(
 					$cache[ $cache_key ],
-					$file['hash']
+					$file['hash'],
+					$optimization_signature
 				)
 			) {
 				\WP_CLI::log(
@@ -1232,8 +1733,34 @@ class Optimize_Images_Command {
 				continue;
 			}
 
+			$resize_label = '';
+
+			if (
+				$this->should_resize(
+					$file,
+					$resize_settings
+				)
+			) {
+				$target_dimensions = $this->get_target_dimensions(
+					$file,
+					$resize_settings
+				);
+
+				$would_resize++;
+
+				if ( $target_dimensions ) {
+					$resize_label = sprintf(
+						' [%d×%d → %d×%d]',
+						$file['width'],
+						$file['height'],
+						$target_dimensions['width'],
+						$target_dimensions['height']
+					);
+				}
+			}
+
 			\WP_CLI::log(
-				"+ {$file['relative']} (would optimize)"
+				"+ {$file['relative']}{$resize_label} (would optimize)"
 			);
 
 			$would_optimize++;
@@ -1242,7 +1769,7 @@ class Optimize_Images_Command {
 		if ( $sync ) {
 			foreach (
 				$stale_files
-				as $relative => $path
+					as $relative => $path
 			) {
 				\WP_CLI::log(
 					"- {$relative} (would remove)"
@@ -1251,30 +1778,58 @@ class Optimize_Images_Command {
 		}
 
 		\WP_CLI::log( '' );
+		\WP_CLI::log( 'Dry run' );
+		\WP_CLI::log( '' );
+
 		\WP_CLI::log(
-			'Found: '
-			. count( $source_files )
+			sprintf(
+				'  %-18s %d',
+				'Found:',
+				count( $source_files )
+			)
 		);
 
 		\WP_CLI::log(
-			"Would optimize: {$would_optimize}"
+			sprintf(
+				'  %-18s %d',
+				'Would optimize:',
+				$would_optimize
+			)
 		);
 
 		\WP_CLI::log(
-			"Unchanged: {$unchanged}"
+			sprintf(
+				'  %-18s %d',
+				'Would resize:',
+				$would_resize
+			)
+		);
+
+		\WP_CLI::log(
+			sprintf(
+				'  %-18s %d',
+				'Unchanged:',
+				$unchanged
+			)
 		);
 
 		if ( $sync ) {
 			\WP_CLI::log(
-				'Would remove: '
-				. count( $stale_files )
+				sprintf(
+					'  %-18s %d',
+					'Would remove:',
+					count( $stale_files )
+				)
 			);
 		}
 
 		\WP_CLI::log(
-			'Source size: '
-			. $this->format_bytes(
-				$total_size
+			sprintf(
+				'  %-18s %s',
+				'Source size:',
+				$this->format_bytes(
+					$total_size
+				)
 			)
 		);
 
@@ -1286,7 +1841,175 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Collect supported source images.
+	 * Final summary.
+	 */
+	private function print_summary(
+		$found,
+		$optimized,
+		$resized,
+		$skipped,
+		$failed,
+		$removed,
+		$original_size,
+		$output_size,
+		$sync
+	) {
+		$total_saved = max(
+			0,
+			$original_size - $output_size
+		);
+
+		$saved_percent = $original_size > 0
+			? round(
+				( $total_saved / $original_size ) * 100
+			)
+			: 0;
+
+		\WP_CLI::log( '' );
+		\WP_CLI::log( 'Optimization complete' );
+		\WP_CLI::log( '' );
+
+		\WP_CLI::log( 'Files' );
+
+		\WP_CLI::log(
+			sprintf(
+				'  %-12s %d',
+				'Found:',
+				$found
+			)
+		);
+
+		\WP_CLI::log(
+			sprintf(
+				'  %-12s %d',
+				'Optimized:',
+				$optimized
+			)
+		);
+
+		\WP_CLI::log(
+			sprintf(
+				'  %-12s %d',
+				'Resized:',
+				$resized
+			)
+		);
+
+		\WP_CLI::log(
+			sprintf(
+				'  %-12s %d',
+				'Skipped:',
+				$skipped
+			)
+		);
+
+		if ( $sync ) {
+			\WP_CLI::log(
+				sprintf(
+					'  %-12s %d',
+					'Removed:',
+					$removed
+				)
+			);
+		}
+
+		\WP_CLI::log(
+			sprintf(
+				'  %-12s %d',
+				'Failed:',
+				$failed
+			)
+		);
+
+		if ( $optimized > 0 ) {
+			\WP_CLI::log( '' );
+			\WP_CLI::log( 'Size' );
+
+			\WP_CLI::log(
+				sprintf(
+					'  %-12s %s',
+					'Before:',
+					$this->format_bytes(
+						$original_size
+					)
+				)
+			);
+
+			\WP_CLI::log(
+				sprintf(
+					'  %-12s %s',
+					'After:',
+					$this->format_bytes(
+						$output_size
+					)
+				)
+			);
+
+			\WP_CLI::log(
+				sprintf(
+					'  %-12s %s (%d%%)',
+					'Saved:',
+					$this->format_bytes(
+						$total_saved
+					),
+					$saved_percent
+				)
+			);
+		}
+
+		if (
+			null !== $this->tinypng_compression_count
+		) {
+			$remaining = max(
+				0,
+				self::TINIFY_FREE_MONTHLY_COMPRESSIONS
+					- $this->tinypng_compression_count
+			);
+
+			\WP_CLI::log( '' );
+			\WP_CLI::log( 'TinyPNG' );
+
+			\WP_CLI::log(
+				sprintf(
+					'  %-12s %d / %d',
+					'Used:',
+					$this->tinypng_compression_count,
+					self::TINIFY_FREE_MONTHLY_COMPRESSIONS
+				)
+			);
+
+			\WP_CLI::log(
+				sprintf(
+					'  %-12s %d free compressions',
+					'Remaining:',
+					$remaining
+				)
+			);
+		}
+
+		\WP_CLI::log( '' );
+
+		if ( $failed > 0 ) {
+			\WP_CLI::warning(
+				sprintf(
+					'Completed with %d failed image%s.',
+					$failed,
+					1 === $failed
+						? ''
+						: 's'
+				)
+			);
+
+			return;
+		}
+
+		\WP_CLI::success(
+			'Images optimized successfully.'
+		);
+	}
+
+	/**
+	 * Collect source images.
 	 */
 	private function collect_source_files(
 		$source_dir,
@@ -1333,6 +2056,10 @@ class Optimize_Images_Command {
 				$relative
 			);
 
+			$dimensions = $this->get_image_dimensions(
+				$source_file
+			);
+
 			$files[ $relative ] = [
 				'source' => $source_file,
 				'relative' => $relative,
@@ -1342,6 +2069,8 @@ class Optimize_Images_Command {
 					'sha256',
 					$source_file
 				),
+				'width' => $dimensions['width'] ?? null,
+				'height' => $dimensions['height'] ?? null,
 			];
 		}
 
@@ -1351,7 +2080,7 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Find optimized files whose source no longer exists.
+	 * Find stale output files.
 	 */
 	private function find_stale_files(
 		$target_dir,
@@ -1378,7 +2107,7 @@ class Optimize_Images_Command {
 
 			if (
 				self::CACHE_FILENAME
-				=== $file->getFilename()
+					=== $file->getFilename()
 			) {
 				continue;
 			}
@@ -1425,7 +2154,7 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Remove stale output files.
+	 * Remove stale files.
 	 */
 	private function remove_stale_files(
 		$stale_files,
@@ -1463,7 +2192,7 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Remove stale cache entries.
+	 * Prune stale cache entries.
 	 */
 	private function prune_cache(
 		&$cache,
@@ -1527,10 +2256,7 @@ class Optimize_Images_Command {
 			}
 
 			$path = $file->getPathname();
-
-			$contents = scandir(
-				$path
-			);
+			$contents = scandir( $path );
 
 			if (
 				is_array( $contents )
@@ -1542,7 +2268,7 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Parse the --extensions option.
+	 * Parse extensions.
 	 */
 	private function get_extensions(
 		$extensions
@@ -1613,7 +2339,7 @@ class Optimize_Images_Command {
 		if ( ! $output ) {
 			return $this->normalize_path(
 				dirname( $source_dir )
-				. '/optimized-images'
+					. '/optimized-images'
 			);
 		}
 
@@ -1637,7 +2363,7 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Check if path is absolute.
+	 * Check absolute path.
 	 */
 	private function is_absolute_path(
 		$path
@@ -1737,7 +2463,7 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Normalize cache/output relative path.
+	 * Normalize relative path.
 	 */
 	private function normalize_relative_path(
 		$path
@@ -1753,7 +2479,7 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Check if a path equals or is inside another.
+	 * Check whether a path is within another path.
 	 */
 	private function is_same_or_child_path(
 		$path,
@@ -1787,7 +2513,7 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Get TinyPNG API key.
+	 * Get API key.
 	 */
 	private function get_api_key() {
 		$environment_key = getenv(
@@ -1809,7 +2535,9 @@ class Optimize_Images_Command {
 	private function get_stored_api_key() {
 		$config_file = $this->get_config_file();
 
-		if ( ! file_exists( $config_file ) ) {
+		if (
+			! file_exists( $config_file )
+		) {
 			return null;
 		}
 
@@ -1828,7 +2556,9 @@ class Optimize_Images_Command {
 
 		if (
 			! is_array( $config )
-			|| empty( $config['tinify_api_key'] )
+			|| empty(
+				$config['tinify_api_key']
+			)
 		) {
 			return null;
 		}
@@ -1839,7 +2569,7 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Get global config file.
+	 * Get config path.
 	 */
 	private function get_config_file() {
 		$home_dir = \WP_CLI\Utils\get_home_dir();
@@ -1849,13 +2579,13 @@ class Optimize_Images_Command {
 				$home_dir,
 				'/\\'
 			)
-			. '/.wp-cli/'
-			. self::CONFIG_FILENAME
+				. '/.wp-cli/'
+				. self::CONFIG_FILENAME
 		);
 	}
 
 	/**
-	 * Get the directory used by the local Node runtime.
+	 * Get local runtime directory.
 	 */
 	private function get_local_runtime_dir() {
 		$home_dir = \WP_CLI\Utils\get_home_dir();
@@ -1865,13 +2595,13 @@ class Optimize_Images_Command {
 				$home_dir,
 				'/\\'
 			)
-			. '/.wp-cli/'
-			. self::LOCAL_RUNTIME_DIRNAME
+				. '/.wp-cli/'
+				. self::LOCAL_RUNTIME_DIRNAME
 		);
 	}
 
 	/**
-	 * Get installed local optimizer script.
+	 * Get local optimizer script.
 	 */
 	private function get_local_optimizer_script() {
 		return $this->get_local_runtime_dir()
@@ -1880,7 +2610,7 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Check local optimizer installation.
+	 * Check local optimizer.
 	 */
 	private function is_local_optimizer_ready() {
 		$runtime_dir = $this->get_local_runtime_dir();
@@ -1891,7 +2621,7 @@ class Optimize_Images_Command {
 		)
 			&& file_exists(
 				$runtime_dir
-				. '/node_modules/sharp/package.json'
+					. '/node_modules/sharp/package.json'
 			)
 			&& $node_version
 			&& version_compare(
@@ -1899,36 +2629,6 @@ class Optimize_Images_Command {
 				self::MINIMUM_NODE_VERSION,
 				'>='
 			);
-	}
-
-	/**
-	 * Read installed Sharp version.
-	 */
-	private function get_sharp_version() {
-		$package_json = $this->get_local_runtime_dir()
-			. '/node_modules/sharp/package.json';
-
-		if ( ! file_exists( $package_json ) ) {
-			return null;
-		}
-
-		$contents = file_get_contents(
-			$package_json
-		);
-
-		if ( false === $contents ) {
-			return null;
-		}
-
-		$data = json_decode(
-			$contents,
-			true
-		);
-
-		return is_array( $data )
-			&& ! empty( $data['version'] )
-				? $data['version']
-				: null;
 	}
 
 	/**
@@ -1965,7 +2665,7 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Determine if an executable is available.
+	 * Check executable availability.
 	 */
 	private function command_exists(
 		$command
@@ -1992,70 +2692,14 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Human-readable engine strategy.
-	 */
-	private function get_engine_strategy_label(
-		$api_key,
-		$local_ready
-	) {
-		if ( $api_key && $local_ready ) {
-			return 'TinyPNG -> Local fallback';
-		}
-
-		if ( $api_key ) {
-			return 'TinyPNG';
-		}
-
-		if ( $local_ready ) {
-			return 'Local';
-		}
-
-		return 'Unavailable';
-	}
-
-	/**
-	 * Format engine name.
-	 */
-	private function format_engine_name(
-		$engine
-	) {
-		return 'tinypng' === $engine
-			? 'TinyPNG'
-			: 'Local';
-	}
-
-	/**
-	 * Support old string cache entries and new metadata entries.
-	 */
-	private function cache_hash_matches(
-		$cache_entry,
-		$source_hash
-	) {
-		$cached_hash = is_array(
-			$cache_entry
-		)
-			? (
-				$cache_entry['hash']
-					?? null
-			)
-			: $cache_entry;
-
-		return is_string(
-			$cached_hash
-		)
-			&& hash_equals(
-				$cached_hash,
-				$source_hash
-			);
-	}
-
-	/**
-	 * Load optimization cache.
+	 * Load cache.
 	 */
 	private function load_cache(
 		$cache_file
 	) {
-		if ( ! file_exists( $cache_file ) ) {
+		if (
+			! file_exists( $cache_file )
+		) {
 			return [];
 		}
 
@@ -2078,7 +2722,7 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Save optimization cache.
+	 * Save cache.
 	 */
 	private function save_cache(
 		$cache_file,
@@ -2107,14 +2751,9 @@ class Optimize_Images_Command {
 				| JSON_UNESCAPED_SLASHES
 		);
 
-		if ( false === $json ) {
-			throw new \RuntimeException(
-				'Could not encode optimization cache.'
-			);
-		}
-
 		if (
-			false === file_put_contents(
+			false === $json
+			|| false === file_put_contents(
 				$cache_file,
 				$json
 			)
@@ -2126,12 +2765,14 @@ class Optimize_Images_Command {
 	}
 
 	/**
-	 * Format bytes for CLI output.
+	 * Format bytes.
 	 */
 	private function format_bytes(
 		$bytes
 	) {
-		if ( $bytes >= 1024 * 1024 ) {
+		if (
+			$bytes >= 1024 * 1024
+		) {
 			return round(
 				$bytes / 1024 / 1024,
 				2
@@ -2154,7 +2795,7 @@ class Optimize_Images_Command {
 	__NAMESPACE__ . '\\Optimize_Images_Command',
 	[
 		'when' => 'before_wp_load',
-		'shortdesc' => 'Optimize images using TinyPNG with a free local fallback.',
+		'shortdesc' => 'Optimize and resize images for the web.',
 		'synopsis' => [
 			[
 				'type' => 'positional',
@@ -2176,6 +2817,24 @@ class Optimize_Images_Command {
 				'optional' => true,
 			],
 			[
+				'type' => 'assoc',
+				'name' => 'max-width',
+				'description' => 'Maximum image width in pixels. Default: 2880.',
+				'optional' => true,
+			],
+			[
+				'type' => 'assoc',
+				'name' => 'max-height',
+				'description' => 'Maximum image height in pixels. Default: 2880.',
+				'optional' => true,
+			],
+			[
+				'type' => 'flag',
+				'name' => 'no-resize',
+				'description' => 'Disable automatic image resizing.',
+				'optional' => true,
+			],
+			[
 				'type' => 'flag',
 				'name' => 'dry-run',
 				'description' => 'Show what would happen without changing files.',
@@ -2184,7 +2843,7 @@ class Optimize_Images_Command {
 			[
 				'type' => 'flag',
 				'name' => 'force',
-				'description' => 'Ignore cache and optimize all selected images.',
+				'description' => 'Ignore cache and process all selected images.',
 				'optional' => true,
 			],
 		],
@@ -2197,11 +2856,19 @@ class Optimize_Images_Command {
 
     wp optimize-images ./images
 
+    wp optimize-images ./images --max-width=1920
+
+    wp optimize-images ./images --max-width=1920 --max-height=1920
+
+    wp optimize-images ./images --no-resize
+
     wp optimize-images ./images --output=./dist/images
 
     wp optimize-images ./images --extensions=jpg,png
 
     wp optimize-images ./images --dry-run
+
+    wp optimize-images ./images --force
 
     wp optimize-images sync ./images
 

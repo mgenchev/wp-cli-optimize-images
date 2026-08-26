@@ -1,8 +1,8 @@
 # WP-CLI Optimize Images
 
-A global WP-CLI command for optimizing images with **TinyPNG** and an automatic free local fallback powered by **Sharp/libvips**.
+A global WP-CLI command for optimizing and resizing images for the web.
 
-TinyPNG is used as the preferred optimization engine when an API key is configured. If no API key is available, the TinyPNG limit is reached, or the API is unavailable, the package automatically falls back to local image optimization.
+The package uses **TinyPNG** as the preferred optimization engine and automatically falls back to a free local optimizer powered by **Sharp/libvips** when TinyPNG is unavailable.
 
 Original images are never modified. Optimized versions are written to a separate output directory.
 
@@ -12,6 +12,11 @@ Original images are never modified. Optimized versions are written to a separate
 * TinyPNG optimization by default
 * Automatic free local fallback with Sharp/libvips
 * Automatic local optimizer setup when first required
+* Automatic proportional image resizing for web use
+* Default maximum dimensions of 2880 × 2880 px
+* Never upscale smaller images
+* Custom maximum width and height
+* Disable resizing when required
 * Process directories recursively
 * Preserve the original directory structure
 * Keep original images untouched
@@ -20,6 +25,7 @@ Original images are never modified. Optimized versions are written to a separate
 * Dry-run mode with no API requests or file changes
 * Automatically skip unchanged images
 * SHA-256 based optimization cache
+* Cache invalidation when resize settings change
 * Force re-optimization when required
 * Sync source and optimized directories
 * Remove optimized images whose source files no longer exist
@@ -29,17 +35,17 @@ Original images are never modified. Optimized versions are written to a separate
 
 The optimization settings are designed for web images with the goal of significantly reducing file size while keeping image quality visually indistinguishable for normal use.
 
-Actual compression depends on the source images. Already optimized images may see smaller reductions.
+Actual compression depends on the source images. Images that are already optimized may see smaller reductions.
 
 ## Requirements
 
 * PHP 8.1+
 * WP-CLI
-* Node.js 20.9+ and npm for the free local optimizer
+* Node.js 20.9+ and npm for resizing and the free local optimizer
 * PHP cURL extension when using TinyPNG
 * TinyPNG API key is optional
 
-If TinyPNG is not configured, the package automatically uses the free local optimizer.
+If TinyPNG is not configured or becomes unavailable, the package automatically uses the free local optimizer.
 
 ## Installation
 
@@ -87,6 +93,68 @@ If the `TINIFY_API_KEY` environment variable exists, it takes precedence over th
 
 If no TinyPNG API key is configured, the package automatically uses the free local optimizer.
 
+## Image Resizing
+
+Images are resized proportionally by default before final optimization when they exceed:
+
+```text
+2880 × 2880 px
+```
+
+Aspect ratio is always preserved and smaller images are never enlarged.
+
+Examples:
+
+```text
+6000 × 4000 → 2880 × 1920
+4000 × 6000 → 1920 × 2880
+2500 × 1600 → unchanged
+800 × 600   → unchanged
+```
+
+This default is intended to provide a practical balance for modern web layouts and high-density displays.
+
+### Custom Maximum Width
+
+```bash
+wp optimize-images ./images --max-width=1920
+```
+
+The default maximum height remains 2880 px.
+
+### Custom Maximum Height
+
+```bash
+wp optimize-images ./images --max-height=1600
+```
+
+The default maximum width remains 2880 px.
+
+### Custom Bounding Box
+
+```bash
+wp optimize-images ./images --max-width=1920 --max-height=1920
+```
+
+The image is resized proportionally so that it fits inside the specified bounds.
+
+For example:
+
+```text
+4000 × 3000 → 1920 × 1440
+3000 × 4000 → 1440 × 1920
+```
+
+### Disable Resizing
+
+To optimize images without changing their pixel dimensions:
+
+```bash
+wp optimize-images ./images --no-resize
+```
+
+`--no-resize` cannot be combined with `--max-width` or `--max-height`.
+
 ## Optimization Engines
 
 The package automatically chooses the appropriate optimization engine.
@@ -94,13 +162,15 @@ The package automatically chooses the appropriate optimization engine.
 When TinyPNG is configured:
 
 ```text
+Resize locally if required
+    ↓
 TinyPNG
     ↓
 Success → use TinyPNG output
 
 API unavailable
-Invalid or unavailable account
 Compression limit reached
+Authentication/account issue
     ↓
 Local Sharp/libvips fallback
 ```
@@ -108,7 +178,7 @@ Local Sharp/libvips fallback
 When TinyPNG is not configured:
 
 ```text
-Local Sharp/libvips optimizer
+Sharp/libvips
 ```
 
 The local optimizer is installed automatically when it is first required.
@@ -120,7 +190,7 @@ Supported local optimization includes:
 * WebP optimization
 * AVIF optimization
 
-If local optimization would result in a file larger than the original, the original file is kept instead.
+If local optimization produces a larger file and the image was not resized, the original file is kept instead.
 
 ## Status
 
@@ -139,25 +209,17 @@ PHP: 8.3.x
 cURL: enabled
 TinyPNG API key: configured
 Node.js: 22.x.x
-Local fallback: ready (Sharp 0.35.x)
+Local optimizer: ready
+Default resize: 2880 × 2880 px
 Supported extensions: jpg, jpeg, png, webp, avif
-
-Strategy: TinyPNG -> local fallback
+Config: C:/Users/User/.wp-cli/optimize-images.json
 
 Success: Ready.
 ```
 
-If TinyPNG is not configured but the local optimizer is available:
-
-```text
-Strategy: local optimizer
-
-Success: Ready with local optimizer.
-```
-
 ## Usage
 
-### Optimize a directory
+### Optimize a Directory
 
 ```bash
 wp optimize-images /path/to/images
@@ -213,15 +275,6 @@ You can specify a different output directory:
 wp optimize-images ./images --output=./dist/images
 ```
 
-For example:
-
-```text
-project/
-├── images/
-└── dist/
-    └── images/
-```
-
 Absolute paths are also supported:
 
 ```bash
@@ -244,10 +297,10 @@ Only WebP:
 wp optimize-images ./images --extensions=webp
 ```
 
-You can combine this with other options:
+Options can be combined:
 
 ```bash
-wp optimize-images ./images --extensions=jpg,png --output=./dist/images
+wp optimize-images ./images --extensions=jpg,png --max-width=1920 --output=./dist/images
 ```
 
 ## Dry Run
@@ -264,17 +317,20 @@ Example:
 Source: D:/Projects/website/images
 Output: D:/Projects/website/optimized-images
 Extensions: jpg,jpeg,png,webp,avif
-Engine: TinyPNG -> Local fallback
+Resize: max 2880 × 2880 px
 Mode: dry-run
 
-+ hero.jpg (would optimize)
++ hero.jpg [6000×4000 → 2880×1920] (would optimize)
 ↷ logo.png (unchanged)
 + team/member.jpg (would optimize)
 
-Found: 3
-Would optimize: 2
-Unchanged: 1
-Source size: 4.21 MB
+Dry run
+
+  Found:             3
+  Would optimize:    2
+  Would resize:      1
+  Unchanged:         1
+  Source size:       8.42 MB
 
 Success: Dry run complete. No files were changed.
 ```
@@ -288,7 +344,7 @@ Dry-run mode:
 
 ## Optimization Cache
 
-The command stores SHA-256 hashes of successfully optimized source images in:
+The command stores SHA-256 hashes and processing settings of successfully optimized source images in:
 
 ```text
 optimized-images/.optimize-images-cache.json
@@ -299,17 +355,27 @@ When the command is run again, unchanged images are skipped:
 ```text
 ↷ hero.jpg (unchanged)
 ↷ logo.png (unchanged)
-
-Success: Optimized: 0 | Skipped: 2 | Failed: 0 | Saved: 0 B
 ```
 
-If an original image changes, its hash changes and the file is automatically optimized again.
+If an original image changes, it is automatically processed again.
 
-This prevents unnecessary TinyPNG API calls and repeated local optimization.
+The cache also includes the current processing settings. For example, changing:
+
+```bash
+--max-width=2880
+```
+
+to:
+
+```bash
+--max-width=1920
+```
+
+causes the affected images to be processed again automatically.
 
 ## Force Optimization
 
-To ignore the cache and optimize every selected image again:
+To ignore the cache and process every selected image again:
 
 ```bash
 wp optimize-images /path/to/images --force
@@ -318,7 +384,7 @@ wp optimize-images /path/to/images --force
 You can combine `--force` with other options:
 
 ```bash
-wp optimize-images ./images --force --extensions=jpg,png
+wp optimize-images ./images --force --max-width=1920 --extensions=jpg,png
 ```
 
 ## Sync
@@ -333,6 +399,7 @@ Sync performs the following actions:
 
 * new source image → optimize
 * changed source image → re-optimize
+* changed resize settings → re-process
 * unchanged source image → skip
 * deleted source image → remove corresponding optimized image
 
@@ -373,14 +440,12 @@ Example output:
 − old-banner.jpg (removed)
 ↷ hero.jpg (unchanged)
 ↷ logo.png (unchanged)
-✓ new-banner.jpg [TinyPNG]  1.40 MB → 184 KB (-87%)
-
-Success: Optimized: 1 | Skipped: 2 | Failed: 0 | Removed: 1 | Saved: 1.22 MB (87%)
+✓ new-banner.jpg [5000×3200 → 2880×1843]  4.20 MB → 512 KB (-88%)
 ```
 
 ## Sync Dry Run
 
-You can preview a sync operation before changing anything:
+Preview a sync operation without changing anything:
 
 ```bash
 wp optimize-images sync ./images --dry-run
@@ -390,34 +455,54 @@ Example:
 
 ```text
 ↷ hero.jpg (unchanged)
-+ new-banner.jpg (would optimize)
++ new-banner.jpg [5000×3200 → 2880×1843] (would optimize)
 - old-banner.jpg (would remove)
 
-Found: 2
-Would optimize: 1
-Unchanged: 1
-Would remove: 1
+Dry run
+
+  Found:             2
+  Would optimize:    1
+  Would resize:      1
+  Unchanged:         1
+  Would remove:      1
+  Source size:       6.82 MB
 
 Success: Dry run complete. No files were changed.
 ```
 
-## Sync with Custom Output
+## Final Summary
 
-```bash
-wp optimize-images sync ./images --output=./dist/images
+After processing, the command displays a summary:
+
+```text
+Optimization complete
+
+Files
+  Found:       14
+  Optimized:   11
+  Resized:     4
+  Skipped:     3
+  Failed:      0
+
+Size
+  Before:      38.72 MB
+  After:       8.41 MB
+  Saved:       30.31 MB (78%)
+
+TinyPNG
+  Used:        148 / 500
+  Remaining:   352 free compressions
+
+Success: Images optimized successfully.
 ```
 
-You can also limit the sync to specific extensions:
+When `sync` removes files, the summary also includes:
 
-```bash
-wp optimize-images sync ./images --extensions=jpg,png
+```text
+Removed:     3
 ```
 
-Or combine everything:
-
-```bash
-wp optimize-images sync ./images --output=./dist/images --extensions=jpg,png --dry-run
-```
+TinyPNG usage is displayed when the API provides the current monthly compression count.
 
 ## Supported Formats
 
@@ -428,41 +513,6 @@ wp optimize-images sync ./images --output=./dist/images --extensions=jpg,png --d
 
 SVG optimization is currently not included.
 
-## Example
-
-```bash
-wp optimize-images "D:\Projects\website\images"
-```
-
-Example output when TinyPNG is available:
-
-```text
-Source: D:/Projects/website/images
-Output: D:/Projects/website/optimized-images
-Extensions: jpg,jpeg,png,webp,avif
-Engine: TinyPNG -> Local fallback
-
-✓ hero.jpg [TinyPNG]  1.23 MB → 122.4 KB (-90%)
-✓ logo.png [TinyPNG]  245.2 KB → 71.8 KB (-71%)
-
-Success: Optimized: 2 | Skipped: 0 | Failed: 0 | Saved: 1.28 MB (87%)
-Engines: TinyPNG 2 | Local 0
-```
-
-If TinyPNG becomes unavailable during the operation:
-
-```text
-✓ hero.jpg [TinyPNG]  1.23 MB → 122.4 KB (-90%)
-
-Warning: TinyPNG is unavailable. Switching to the free local optimizer for the remaining images.
-
-✓ banner.jpg [Local]  1.45 MB → 312 KB (-78%)
-✓ photo.webp [Local]  820 KB → 246 KB (-70%)
-
-Success: Optimized: 3 | Skipped: 0 | Failed: 0 | Saved: 2.82 MB (81%)
-Engines: TinyPNG 1 | Local 2
-```
-
 ## Command Overview
 
 ```bash
@@ -472,8 +522,17 @@ wp optimize-images configure
 # Check configuration
 wp optimize-images status
 
-# Optimize a directory
+# Optimize with default 2880 × 2880 max dimensions
 wp optimize-images ./images
+
+# Custom maximum width
+wp optimize-images ./images --max-width=1920
+
+# Custom maximum dimensions
+wp optimize-images ./images --max-width=1920 --max-height=1920
+
+# Disable resizing
+wp optimize-images ./images --no-resize
 
 # Custom output
 wp optimize-images ./images --output=./dist/images
@@ -493,6 +552,17 @@ wp optimize-images sync ./images
 # Preview synchronization
 wp optimize-images sync ./images --dry-run
 ```
+
+## Performance
+
+Image processing currently happens sequentially.
+
+Large batches can take some time because resizing and local optimization use Sharp through Node.js, while TinyPNG optimization also involves uploading and downloading each image.
+
+Future performance improvements may include:
+
+* batch Sharp processing
+* concurrent TinyPNG requests
 
 ## Updating
 
