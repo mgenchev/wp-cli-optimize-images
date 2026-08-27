@@ -22,6 +22,9 @@ class Tiny_Png_Optimization_Exception extends \RuntimeException {
 
 class Optimize_Images_Command {
 
+	private const VERSION = '1.0.0';
+	private const MAX_DIMENSION = 20000;
+
 	private const SUPPORTED_EXTENSIONS = [
 		'jpg',
 		'jpeg',
@@ -62,9 +65,19 @@ class Optimize_Images_Command {
 	private $progress_started_at = 0.0;
 	private $progress_last_rendered_at = 0.0;
 	private $progress_rendered = false;
+	private $temp_artifacts = [];
+	private $shutdown_cleanup_registered = false;
+	private $active_process = null;
 
 	public function __invoke( $args, $assoc_args ) {
+		$this->register_shutdown_cleanup();
+
 		$action = $args[0] ?? null;
+
+		if ( 'version' === $action ) {
+			$this->version();
+			return;
+		}
 
 		if ( 'configure' === $action ) {
 			$this->configure();
@@ -105,6 +118,11 @@ class Optimize_Images_Command {
 		$this->optimize( $action, $assoc_args, false );
 	}
 
+
+	private function version() {
+		\WP_CLI::log( 'WP-CLI Optimize Images ' . self::VERSION );
+	}
+
 	private function configure() {
 		\WP_CLI::log( 'TinyPNG API configuration' );
 		\WP_CLI::log( '' );
@@ -142,6 +160,8 @@ class Optimize_Images_Command {
 		$stored_key = $this->get_stored_api_key();
 		$node_version = $this->get_node_version();
 		$local_ready = $this->is_local_optimizer_ready();
+		$sharp_version = $this->get_local_dependency_version( 'sharp' );
+		$svgo_version = $this->get_local_dependency_version( 'svgo' );
 
 		if ( $environment_key ) {
 			$key_status = 'configured via TINIFY_API_KEY';
@@ -151,17 +171,35 @@ class Optimize_Images_Command {
 			$key_status = 'not configured';
 		}
 
-		\WP_CLI::log( 'WP-CLI Optimize Images' );
+		\WP_CLI::log( 'WP-CLI Optimize Images ' . self::VERSION );
 		\WP_CLI::log( '' );
-		\WP_CLI::log( 'PHP: ' . PHP_VERSION );
-		\WP_CLI::log( 'cURL: ' . ( function_exists( 'curl_init' ) ? 'enabled' : 'disabled' ) );
-		\WP_CLI::log( 'TinyPNG API key: ' . $key_status );
-		\WP_CLI::log( 'Node.js: ' . ( $node_version ?: 'not found' ) );
-		\WP_CLI::log( 'Local optimizer: ' . ( $local_ready ? 'ready' : 'not installed' ) );
-		\WP_CLI::log( sprintf( 'Default resize: %d × %d px', self::DEFAULT_MAX_WIDTH, self::DEFAULT_MAX_HEIGHT ) );
-		\WP_CLI::log( sprintf( 'Default local quality: %d%%', self::DEFAULT_QUALITY ) );
-		\WP_CLI::log( 'Supported extensions: ' . implode( ', ', self::SUPPORTED_EXTENSIONS ) );
-		\WP_CLI::log( 'Config: ' . $config_file );
+
+		$rows = [
+			[ 'PHP', PHP_VERSION ],
+			[ 'cURL', function_exists( 'curl_init' ) ? 'enabled' : 'disabled' ],
+			[ 'Node.js', $node_version ?: 'not found' ],
+			[ 'TinyPNG', $key_status ],
+			[ 'Sharp', $sharp_version ? 'ready (' . $sharp_version . ')' : 'not installed' ],
+			[ 'SVGO', $svgo_version ? 'ready (' . $svgo_version . ')' : 'not installed' ],
+			[
+				'Default resize',
+				sprintf( '%d × %d px', self::DEFAULT_MAX_WIDTH, self::DEFAULT_MAX_HEIGHT ),
+			],
+			[ 'Default quality', self::DEFAULT_QUALITY . '%' ],
+			[ 'Formats', implode( ', ', self::SUPPORTED_EXTENSIONS ) ],
+			[ 'Config', $config_file ],
+		];
+
+		foreach ( $rows as $row ) {
+			\WP_CLI::log(
+				sprintf(
+					'  %-18s %s',
+					$row[0],
+					$row[1]
+				)
+			);
+		}
+
 		\WP_CLI::log( '' );
 
 		if (
@@ -177,20 +215,15 @@ class Optimize_Images_Command {
 		\WP_CLI::warning( 'Node.js and npm are required when TinyPNG is not available.' );
 	}
 
-
 	private function audit( $directory, $assoc_args ) {
-		$source_dir = realpath( $directory );
-
-		if ( ! $source_dir || ! is_dir( $source_dir ) ) {
-			\WP_CLI::error( 'Directory does not exist.' );
-		}
-
-		$source_dir = $this->normalize_path( $source_dir );
+		$source_dir = $this->resolve_source_directory( $directory );
 		$extensions = $this->get_extensions( $assoc_args['extensions'] ?? null );
 		$resize_settings = $this->get_resize_settings( $assoc_args );
+		$quality = $this->get_quality( $assoc_args, false );
 		$source_files = $this->collect_source_files( $source_dir, $extensions );
 
 		$total_size = 0;
+		$raster_size = 0;
 		$raster_count = 0;
 		$svg_count = 0;
 		$large_count = 0;
@@ -198,7 +231,7 @@ class Optimize_Images_Command {
 		$formats = [];
 		$largest = [];
 
-		foreach ( $source_files as $file ) {
+		foreach ( $source_files as &$file ) {
 			$total_size += $file['size'];
 
 			if ( $file['size'] > self::AUDIT_LARGE_FILE_BYTES ) {
@@ -219,6 +252,7 @@ class Optimize_Images_Command {
 				$svg_count++;
 			} else {
 				$raster_count++;
+				$raster_size += $file['size'];
 				$this->hydrate_image_dimensions( $file, [
 					'enabled' => true,
 					'max_width' => self::DEFAULT_MAX_WIDTH,
@@ -235,6 +269,7 @@ class Optimize_Images_Command {
 
 			$largest[] = $file;
 		}
+		unset( $file );
 
 		usort(
 			$largest,
@@ -244,8 +279,16 @@ class Optimize_Images_Command {
 		$largest = array_slice( $largest, 0, self::AUDIT_TOP_FILES );
 		ksort( $formats );
 
+		$estimate = $this->estimate_audit_processing_time(
+			$raster_count,
+			$raster_size,
+			$svg_count,
+			$oversized_count
+		);
+
 		\WP_CLI::log( "Source: {$source_dir}" );
 		\WP_CLI::log( 'Extensions: ' . implode( ',', $extensions ) );
+		\WP_CLI::log( sprintf( 'Local quality: %d%%', $quality ) );
 
 		if ( $resize_settings['enabled'] ) {
 			\WP_CLI::log(
@@ -262,15 +305,18 @@ class Optimize_Images_Command {
 		\WP_CLI::log( '' );
 		\WP_CLI::log( 'Audit' );
 		\WP_CLI::log( '' );
-		\WP_CLI::log( sprintf( '  %-18s %d', 'Files:', count( $source_files ) ) );
-		\WP_CLI::log( sprintf( '  %-18s %d', 'Raster:', $raster_count ) );
-		\WP_CLI::log( sprintf( '  %-18s %d', 'SVG:', $svg_count ) );
-		\WP_CLI::log( sprintf( '  %-18s %s', 'Total size:', $this->format_bytes( $total_size ) ) );
-		\WP_CLI::log( sprintf( '  %-18s %d', 'Over 1 MB:', $large_count ) );
+		\WP_CLI::log( sprintf( '  %-20s %d', 'Files', count( $source_files ) ) );
+		\WP_CLI::log( sprintf( '  %-20s %d', 'Raster', $raster_count ) );
+		\WP_CLI::log( sprintf( '  %-20s %d', 'SVG', $svg_count ) );
+		\WP_CLI::log( sprintf( '  %-20s %s', 'Total size', $this->format_bytes( $total_size ) ) );
+		\WP_CLI::log( sprintf( '  %-20s %d', 'Over 1 MB', $large_count ) );
 
 		if ( $resize_settings['enabled'] ) {
-			\WP_CLI::log( sprintf( '  %-18s %d', 'Would resize:', $oversized_count ) );
+			\WP_CLI::log( sprintf( '  %-20s %d', 'Would resize', $oversized_count ) );
 		}
+
+		\WP_CLI::log( sprintf( '  %-20s %s', 'Estimated time', $estimate ) );
+		\WP_CLI::log( '  Estimate is approximate and depends on API/network speed.' );
 
 		if ( ! empty( $formats ) ) {
 			\WP_CLI::log( '' );
@@ -317,13 +363,7 @@ class Optimize_Images_Command {
 	}
 
 	private function optimize( $directory, $assoc_args, $sync ) {
-		$source_dir = realpath( $directory );
-
-		if ( ! $source_dir || ! is_dir( $source_dir ) ) {
-			\WP_CLI::error( 'Directory does not exist.' );
-		}
-
-		$source_dir = $this->normalize_path( $source_dir );
+		$source_dir = $this->resolve_source_directory( $directory );
 		$extensions = $this->get_extensions( $assoc_args['extensions'] ?? null );
 		$resize_settings = $this->get_resize_settings( $assoc_args );
 		$quality = $this->get_quality( $assoc_args );
@@ -373,6 +413,10 @@ class Optimize_Images_Command {
 			\WP_CLI::error( 'Could not create output directory.' );
 		}
 
+		if ( ! is_writable( $target_dir ) ) {
+			\WP_CLI::error( 'Output directory is not writable.' );
+		}
+
 		\WP_CLI::log( "Source: {$source_dir}" );
 		\WP_CLI::log( "Output: {$target_dir}" );
 		\WP_CLI::log( 'Extensions: ' . implode( ',', $extensions ) );
@@ -418,7 +462,6 @@ class Optimize_Images_Command {
 						$cache_dirty = true;
 					}
 
-					\WP_CLI::log( "↷ {$file['relative']} (unchanged)" );
 					$skipped++;
 					continue;
 				}
@@ -451,11 +494,44 @@ class Optimize_Images_Command {
 			];
 		}
 
-		$results = [];
+		$error_jobs = array_filter(
+			$pending,
+			static fn( $job ) => ! empty( $job['error'] )
+		);
+
 		$processable = array_filter(
 			$pending,
 			static fn( $job ) => empty( $job['error'] )
 		);
+
+		if ( empty( $processable ) && empty( $error_jobs ) ) {
+			if ( $cache_dirty ) {
+				$this->save_cache( $cache_file, $cache );
+			}
+
+			$this->print_up_to_date_summary(
+				count( $source_files ),
+				$skipped,
+				$removed,
+				$sync
+			);
+			$this->cleanup_temp_artifacts();
+			return;
+		}
+
+		if ( $skipped > 0 ) {
+			\WP_CLI::log(
+				sprintf(
+					'↷ %d unchanged file%s skipped',
+					$skipped,
+					1 === $skipped ? '' : 's'
+				)
+			);
+			\WP_CLI::log( '' );
+		}
+
+		$results = [];
+
 
 		foreach ( $pending as $cache_key => $job ) {
 			if ( ! empty( $job['error'] ) ) {
@@ -906,15 +982,37 @@ class Optimize_Images_Command {
 					'error' => 'Could not download optimized image.',
 					'global_failure' => $status >= 500 || in_array( $status, [ 401, 403, 429 ], true ),
 				];
-			} elseif ( false === file_put_contents( $jobs[ $cache_key ]['target'], $image ) ) {
-				$results[ $cache_key ] = [
-					'success' => false,
-					'error' => 'Could not save optimized image.',
-					'global_failure' => false,
-				];
 			} else {
-				$results[ $cache_key ] = [ 'success' => true ];
-				$this->tick_progress( $cache_key );
+				$temp_target = $this->create_target_temp_file(
+					$jobs[ $cache_key ]['target']
+				);
+
+				if ( false === file_put_contents( $temp_target, $image ) ) {
+					@unlink( $temp_target );
+					$this->unregister_temp_artifact( $temp_target );
+					$results[ $cache_key ] = [
+						'success' => false,
+						'error' => 'Could not save optimized image.',
+						'global_failure' => false,
+					];
+				} else {
+					try {
+						$this->replace_output_file(
+							$temp_target,
+							$jobs[ $cache_key ]['target']
+						);
+						$results[ $cache_key ] = [ 'success' => true ];
+						$this->tick_progress( $cache_key );
+					} catch ( \Exception $e ) {
+						@unlink( $temp_target );
+						$this->unregister_temp_artifact( $temp_target );
+						$results[ $cache_key ] = [
+							'success' => false,
+							'error' => $e->getMessage(),
+							'global_failure' => false,
+						];
+					}
+				}
 			}
 
 			curl_multi_remove_handle( $multi, $ch );
@@ -974,9 +1072,7 @@ class Optimize_Images_Command {
 		$batch_jobs = [];
 
 		foreach ( $jobs as $cache_key => $job ) {
-			$temp_target = $job['target']
-				. '.tmp-'
-				. bin2hex( random_bytes( 6 ) );
+			$temp_target = $this->create_target_temp_file( $job['target'] );
 
 			$is_svg = 'svg' === $job['file']['extension'];
 
@@ -1006,6 +1102,7 @@ class Optimize_Images_Command {
 				if ( file_exists( $batch_job['output'] ) ) {
 					@unlink( $batch_job['output'] );
 				}
+				$this->unregister_temp_artifact( $batch_job['output'] );
 
 				$results[ $cache_key ] = [
 					'success' => false,
@@ -1019,6 +1116,7 @@ class Optimize_Images_Command {
 
 			if ( false === $optimized_size ) {
 				@unlink( $batch_job['output'] );
+				$this->unregister_temp_artifact( $batch_job['output'] );
 				$results[ $cache_key ] = [
 					'success' => false,
 					'error' => 'Could not read local optimizer output.',
@@ -1027,40 +1125,30 @@ class Optimize_Images_Command {
 			}
 
 			if ( $optimized_size >= $source_size && empty( $job['will_resize'] ) ) {
-				@unlink( $batch_job['output'] );
-
-				if ( ! copy( $job['file']['source'], $job['target'] ) ) {
+				if ( ! copy( $job['file']['source'], $batch_job['output'] ) ) {
+					@unlink( $batch_job['output'] );
+					$this->unregister_temp_artifact( $batch_job['output'] );
 					$results[ $cache_key ] = [
 						'success' => false,
-						'error' => 'Could not save local optimizer output.',
+						'error' => 'Could not preserve the original image as output.',
 					];
 					continue;
 				}
-
-				$results[ $cache_key ] = [ 'success' => true ];
-				continue;
 			}
 
-			if ( file_exists( $job['target'] ) && ! unlink( $job['target'] ) ) {
+			try {
+				$this->replace_output_file(
+					$batch_job['output'],
+					$job['target']
+				);
+			} catch ( \Exception $e ) {
 				@unlink( $batch_job['output'] );
+				$this->unregister_temp_artifact( $batch_job['output'] );
 				$results[ $cache_key ] = [
 					'success' => false,
-					'error' => 'Could not replace existing optimized image.',
+					'error' => $e->getMessage(),
 				];
 				continue;
-			}
-
-			if ( ! rename( $batch_job['output'], $job['target'] ) ) {
-				if ( ! copy( $batch_job['output'], $job['target'] ) ) {
-					@unlink( $batch_job['output'] );
-					$results[ $cache_key ] = [
-						'success' => false,
-						'error' => 'Could not save local optimizer output.',
-					];
-					continue;
-				}
-
-				@unlink( $batch_job['output'] );
 			}
 
 			$results[ $cache_key ] = [ 'success' => true ];
@@ -1082,6 +1170,9 @@ class Optimize_Images_Command {
 			throw new \RuntimeException( 'Could not create local optimizer manifest.' );
 		}
 
+		$this->register_temp_artifact( $manifest_file );
+		$this->register_temp_artifact( $result_file );
+
 		$manifest = [
 			'concurrency' => $this->get_local_batch_concurrency(),
 			'jobs' => [],
@@ -1099,6 +1190,8 @@ class Optimize_Images_Command {
 		if ( false === $json || false === file_put_contents( $manifest_file, $json ) ) {
 			@unlink( $manifest_file );
 			@unlink( $result_file );
+			$this->unregister_temp_artifact( $manifest_file );
+			$this->unregister_temp_artifact( $result_file );
 			throw new \RuntimeException( 'Could not write local optimizer manifest.' );
 		}
 
@@ -1117,9 +1210,15 @@ class Optimize_Images_Command {
 
 		$process = proc_open( $command, $descriptors, $pipes );
 
+		if ( is_resource( $process ) ) {
+			$this->active_process = $process;
+		}
+
 		if ( ! is_resource( $process ) ) {
 			@unlink( $manifest_file );
 			@unlink( $result_file );
+			$this->unregister_temp_artifact( $manifest_file );
+			$this->unregister_temp_artifact( $result_file );
 			throw new \RuntimeException( 'Could not start local batch optimizer.' );
 		}
 
@@ -1200,6 +1299,7 @@ class Optimize_Images_Command {
 		fclose( $pipes[2] );
 
 		$exit_code = proc_close( $process );
+		$this->active_process = null;
 
 		if (
 			-1 === $exit_code
@@ -1211,9 +1311,11 @@ class Optimize_Images_Command {
 		}
 
 		@unlink( $manifest_file );
+		$this->unregister_temp_artifact( $manifest_file );
 
 		if ( 0 !== $exit_code || ! file_exists( $result_file ) ) {
 			@unlink( $result_file );
+			$this->unregister_temp_artifact( $result_file );
 			throw new \RuntimeException(
 				'' !== trim( $stderr )
 					? trim( $stderr )
@@ -1223,6 +1325,7 @@ class Optimize_Images_Command {
 
 		$result_json = file_get_contents( $result_file );
 		@unlink( $result_file );
+		$this->unregister_temp_artifact( $result_file );
 		$decoded = json_decode( (string) $result_json, true );
 
 		if ( ! is_array( $decoded ) ) {
@@ -1245,6 +1348,130 @@ class Optimize_Images_Command {
 		return $results;
 	}
 
+
+	private function register_shutdown_cleanup() {
+		if ( $this->shutdown_cleanup_registered ) {
+			return;
+		}
+
+		$this->shutdown_cleanup_registered = true;
+
+		register_shutdown_function(
+			function () {
+				if ( is_resource( $this->active_process ) ) {
+					@proc_terminate( $this->active_process );
+				}
+
+				$this->clear_progress_line();
+				$this->cleanup_temp_artifacts();
+			}
+		);
+
+		if (
+			function_exists( 'pcntl_async_signals' )
+			&& function_exists( 'pcntl_signal' )
+			&& defined( 'SIGINT' )
+		) {
+			pcntl_async_signals( true );
+			pcntl_signal(
+				SIGINT,
+				function () {
+					if ( is_resource( $this->active_process ) ) {
+						@proc_terminate( $this->active_process );
+					}
+
+					$this->clear_progress_line();
+					$this->cleanup_temp_artifacts();
+					\WP_CLI::warning( 'Interrupted. Temporary files were cleaned up.' );
+					exit( 130 );
+				}
+			);
+		}
+	}
+
+	private function register_temp_artifact( $path ) {
+		if ( $path ) {
+			$this->temp_artifacts[ $this->normalize_path( $path ) ] = true;
+		}
+	}
+
+	private function unregister_temp_artifact( $path ) {
+		if ( ! $path ) {
+			return;
+		}
+
+		unset(
+			$this->temp_artifacts[ $this->normalize_path( $path ) ]
+		);
+	}
+
+	private function cleanup_temp_artifacts() {
+		$paths = array_keys( $this->temp_artifacts );
+
+		foreach ( $paths as $path ) {
+			if ( is_dir( $path ) ) {
+				$this->cleanup_temp_directory( $path );
+				continue;
+			}
+
+			if ( file_exists( $path ) ) {
+				@unlink( $path );
+			}
+
+			$this->unregister_temp_artifact( $path );
+		}
+	}
+
+	private function create_target_temp_file( $target ) {
+		$temp_file = $target
+			. '.tmp-'
+			. bin2hex( random_bytes( 6 ) );
+
+		$this->register_temp_artifact( $temp_file );
+		return $temp_file;
+	}
+
+	private function replace_output_file( $temp_file, $target_file ) {
+		if ( ! file_exists( $temp_file ) ) {
+			throw new \RuntimeException( 'Temporary output file does not exist.' );
+		}
+
+		if ( ! file_exists( $target_file ) ) {
+			if ( ! @rename( $temp_file, $target_file ) ) {
+				throw new \RuntimeException( 'Could not move temporary output into place.' );
+			}
+
+			$this->unregister_temp_artifact( $temp_file );
+			return;
+		}
+
+		if ( @rename( $temp_file, $target_file ) ) {
+			$this->unregister_temp_artifact( $temp_file );
+			return;
+		}
+
+		$backup_file = $target_file
+			. '.bak-'
+			. bin2hex( random_bytes( 6 ) );
+
+		$this->register_temp_artifact( $backup_file );
+
+		if ( ! @rename( $target_file, $backup_file ) ) {
+			$this->unregister_temp_artifact( $backup_file );
+			throw new \RuntimeException( 'Could not prepare existing output for replacement.' );
+		}
+
+		if ( ! @rename( $temp_file, $target_file ) ) {
+			@rename( $backup_file, $target_file );
+			$this->unregister_temp_artifact( $backup_file );
+			throw new \RuntimeException( 'Could not replace existing output file.' );
+		}
+
+		$this->unregister_temp_artifact( $temp_file );
+		@unlink( $backup_file );
+		$this->unregister_temp_artifact( $backup_file );
+	}
+
 	private function create_temp_directory() {
 		$path = $this->normalize_path(
 			sys_get_temp_dir()
@@ -1256,6 +1483,7 @@ class Optimize_Images_Command {
 			throw new \RuntimeException( 'Could not create temporary image directory.' );
 		}
 
+		$this->register_temp_artifact( $path );
 		return $path;
 	}
 
@@ -1276,6 +1504,7 @@ class Optimize_Images_Command {
 		}
 
 		@rmdir( $directory );
+		$this->unregister_temp_artifact( $directory );
 	}
 
 	private function ensure_local_optimizer() {
@@ -1977,6 +2206,29 @@ class Optimize_Images_Command {
 		return substr( $value, 0, $available ) . '…' . $suffix;
 	}
 
+
+	private function print_up_to_date_summary( $found, $skipped, $removed, $sync ) {
+		\WP_CLI::log( '' );
+
+		if ( 0 === $found ) {
+			\WP_CLI::success( 'No supported files found.' );
+			return;
+		}
+
+		\WP_CLI::log( 'Nothing to optimize.' );
+		\WP_CLI::log( '' );
+		\WP_CLI::log( 'Files' );
+		\WP_CLI::log( sprintf( '  %d total', $found ) );
+		\WP_CLI::log( sprintf( '  %d unchanged', $skipped ) );
+
+		if ( $sync ) {
+			\WP_CLI::log( sprintf( '  %d removed', $removed ) );
+		}
+
+		\WP_CLI::log( '' );
+		\WP_CLI::success( 'Everything is up to date.' );
+	}
+
 	private function print_summary(
 		$found,
 		$optimized,
@@ -2053,6 +2305,7 @@ class Optimize_Images_Command {
 		\WP_CLI::log( '' );
 
 		if ( $failed > 0 ) {
+			$this->cleanup_temp_artifacts();
 			\WP_CLI::warning(
 				sprintf(
 					'Completed with %d failed image%s.',
@@ -2060,9 +2313,10 @@ class Optimize_Images_Command {
 					1 === $failed ? '' : 's'
 				)
 			);
-			return;
+			\WP_CLI::halt( 1 );
 		}
 
+		$this->cleanup_temp_artifacts();
 		\WP_CLI::success( 'Images optimized successfully.' );
 	}
 
@@ -2198,6 +2452,63 @@ class Optimize_Images_Command {
 		}
 	}
 
+
+	private function resolve_source_directory( $directory ) {
+		$source_dir = realpath( $directory );
+
+		if ( ! $source_dir || ! is_dir( $source_dir ) ) {
+			\WP_CLI::error( 'Directory does not exist.' );
+		}
+
+		if ( ! is_readable( $source_dir ) ) {
+			\WP_CLI::error( 'Directory is not readable.' );
+		}
+
+		return $this->normalize_path( $source_dir );
+	}
+
+	private function estimate_audit_processing_time(
+		$raster_count,
+		$raster_size,
+		$svg_count,
+		$oversized_count
+	) {
+		if ( 0 === $raster_count && 0 === $svg_count ) {
+			return '~0:00';
+		}
+
+		$raster_mb = $raster_size / 1024 / 1024;
+		$tinypng_available = (bool) $this->get_api_key()
+			&& function_exists( 'curl_init' );
+
+		if ( $tinypng_available ) {
+			$waves = (int) ceil(
+				$raster_count / self::TINYPNG_CONCURRENCY
+			);
+			$seconds = ( $waves * 4.0 )
+				+ ( $raster_mb * 0.9 )
+				+ ( $oversized_count * 0.75 )
+				+ ( $svg_count * 0.12 );
+		} else {
+			$workers = max( 1, $this->get_local_batch_concurrency() );
+			$seconds = (
+				( $raster_mb * 0.8 )
+				+ ( $raster_count * 0.7 )
+				+ ( $svg_count * 0.2 )
+			) / min( $workers, max( 1, $raster_count + $svg_count ) );
+		}
+
+		$seconds = max( 2.0, $seconds );
+		$minimum = max( 1, (int) floor( $seconds * 0.7 ) );
+		$maximum = max( $minimum + 1, (int) ceil( $seconds * 1.4 ) );
+
+		return sprintf(
+			'~%s–%s',
+			$this->format_progress_duration( $minimum ),
+			$this->format_progress_duration( $maximum )
+		);
+	}
+
 	private function get_resize_settings( $assoc_args ) {
 		$no_resize = isset( $assoc_args['no-resize'] );
 
@@ -2238,6 +2549,16 @@ class Optimize_Images_Command {
 
 		if ( ! ctype_digit( (string) $value ) || (int) $value < 1 ) {
 			\WP_CLI::error( "--{$name} must be a positive integer." );
+		}
+
+		if ( (int) $value > self::MAX_DIMENSION ) {
+			\WP_CLI::error(
+				sprintf(
+					'--%s cannot exceed %d pixels.',
+					$name,
+					self::MAX_DIMENSION
+				)
+			);
 		}
 
 		return (int) $value;
@@ -2332,7 +2653,7 @@ class Optimize_Images_Command {
 		);
 	}
 
-	private function get_quality( $assoc_args ) {
+	private function get_quality( $assoc_args, $warn = true ) {
 		$value = $assoc_args['quality'] ?? self::DEFAULT_QUALITY;
 
 		if (
@@ -2343,7 +2664,15 @@ class Optimize_Images_Command {
 			\WP_CLI::error( '--quality must be an integer between 1 and 100.' );
 		}
 
-		return (int) $value;
+		$quality = (int) $value;
+
+		if ( $warn && $quality < 40 ) {
+			\WP_CLI::warning(
+				'Local quality below 40 may cause visible compression artifacts.'
+			);
+		}
+
+		return $quality;
 	}
 
 	private function get_file_hash( &$file ) {
@@ -2533,6 +2862,27 @@ class Optimize_Images_Command {
 		return $this->get_local_runtime_dir() . '/' . self::LOCAL_OPTIMIZER_FILENAME;
 	}
 
+
+	private function get_local_dependency_version( $package ) {
+		$package_file = $this->get_local_runtime_dir()
+			. '/node_modules/'
+			. $package
+			. '/package.json';
+
+		if ( ! file_exists( $package_file ) ) {
+			return null;
+		}
+
+		$contents = file_get_contents( $package_file );
+		$data = false !== $contents
+			? json_decode( $contents, true )
+			: null;
+
+		return is_array( $data ) && ! empty( $data['version'] )
+			? (string) $data['version']
+			: null;
+	}
+
 	private function is_local_optimizer_ready() {
 		$runtime_dir = $this->get_local_runtime_dir();
 		$node_version = $this->get_node_version();
@@ -2616,6 +2966,7 @@ class Optimize_Images_Command {
 		return is_array( $data ) ? $data : [];
 	}
 
+
 	private function save_cache( $cache_file, $cache ) {
 		$cache_dir = dirname( $cache_file );
 
@@ -2623,10 +2974,31 @@ class Optimize_Images_Command {
 			throw new \RuntimeException( 'Could not create cache directory.' );
 		}
 
-		$json = json_encode( $cache, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES );
+		$json = json_encode(
+			$cache,
+			JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES
+		);
 
-		if ( false === $json || false === file_put_contents( $cache_file, $json ) ) {
-			throw new \RuntimeException( 'Could not save optimization cache.' );
+		if ( false === $json ) {
+			throw new \RuntimeException( 'Could not encode optimization cache.' );
+		}
+
+		$temp_file = $this->create_target_temp_file( $cache_file );
+
+		if ( false === file_put_contents( $temp_file, $json, LOCK_EX ) ) {
+			@unlink( $temp_file );
+			$this->unregister_temp_artifact( $temp_file );
+			throw new \RuntimeException( 'Could not write optimization cache.' );
+		}
+
+		try {
+			$this->replace_output_file( $temp_file, $cache_file );
+		} catch ( \Exception $e ) {
+			@unlink( $temp_file );
+			$this->unregister_temp_artifact( $temp_file );
+			throw new \RuntimeException(
+				'Could not save optimization cache: ' . $e->getMessage()
+			);
 		}
 	}
 
@@ -2653,7 +3025,7 @@ class Optimize_Images_Command {
 			[
 				'type' => 'positional',
 				'name' => 'arguments',
-				'description' => 'Image directory, or configure/status/audit/sync command.',
+				'description' => 'Image directory, or configure/status/version/audit/sync command.',
 				'optional' => true,
 				'repeating' => true,
 			],
@@ -2712,6 +3084,8 @@ class Optimize_Images_Command {
     wp optimize-images configure
 
     wp optimize-images status
+
+    wp optimize-images version
 
     wp optimize-images audit ./images
 

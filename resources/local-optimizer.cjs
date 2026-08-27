@@ -55,12 +55,12 @@ function encodeResizeOutput(image, ext) {
 	}
 }
 
-function encodeOptimizedOutput(image, ext) {
+function encodeOptimizedOutput(image, ext, quality) {
 	switch (ext) {
 		case 'jpg':
 		case 'jpeg':
 			return image.jpeg({
-				quality: 82,
+				quality,
 				mozjpeg: true,
 				chromaSubsampling: '4:2:0',
 			});
@@ -68,7 +68,7 @@ function encodeOptimizedOutput(image, ext) {
 		case 'png':
 			return image.png({
 				palette: true,
-				quality: 90,
+				quality,
 				compressionLevel: 9,
 				effort: 10,
 				colours: 256,
@@ -77,14 +77,14 @@ function encodeOptimizedOutput(image, ext) {
 
 		case 'webp':
 			return image.webp({
-				quality: 82,
+				quality,
 				effort: 6,
 				smartSubsample: true,
 			});
 
 		case 'avif':
 			return image.avif({
-				quality: 60,
+				quality,
 				effort: 9,
 			});
 
@@ -118,6 +118,10 @@ async function processRaster(job) {
 	const ext = String(job.extension || '').toLowerCase();
 	const maxWidth = Number(job.max_width || 0);
 	const maxHeight = Number(job.max_height || 0);
+	const quality = Math.min(
+		100,
+		Math.max(1, Number(job.quality || 80))
+	);
 
 	let image = sharp(job.input).autoOrient();
 	image = resizeImage(image, maxWidth, maxHeight);
@@ -125,7 +129,7 @@ async function processRaster(job) {
 	if (job.mode === 'resize') {
 		image = encodeResizeOutput(image, ext);
 	} else if (job.mode === 'optimize') {
-		image = encodeOptimizedOutput(image, ext);
+		image = encodeOptimizedOutput(image, ext, quality);
 	} else {
 		throw new Error(`Unsupported processing mode: ${job.mode}`);
 	}
@@ -170,7 +174,15 @@ async function processWithConcurrency(jobs, concurrency) {
 				return;
 			}
 
+			process.stdout.write(
+				`WP_OPTIMIZE_START:${String(jobs[index].id)}\n`
+			);
+
 			results[index] = await processJob(jobs[index]);
+
+			process.stdout.write(
+				`WP_OPTIMIZE_PROGRESS:${String(jobs[index].id)}\n`
+			);
 		}
 	}
 
