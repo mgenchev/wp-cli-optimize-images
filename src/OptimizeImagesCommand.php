@@ -40,14 +40,28 @@ class Optimize_Images_Command {
 	private const MINIMUM_NODE_VERSION = '20.9.0';
 	private const DEFAULT_MAX_WIDTH = 2880;
 	private const DEFAULT_MAX_HEIGHT = 2880;
+	private const DEFAULT_QUALITY = 80;
+	private const AUDIT_LARGE_FILE_BYTES = 1048576;
+	private const AUDIT_TOP_FILES = 10;
 	private const TINIFY_FREE_MONTHLY_COMPRESSIONS = 500;
-	private const PROCESSING_VERSION = 2;
+	private const PROCESSING_VERSION = 3;
 	private const TINYPNG_CONCURRENCY = 3;
-	private const LOCAL_BATCH_CONCURRENCY = 4;
+	private const MAX_LOCAL_BATCH_CONCURRENCY = 4;
 
 	private $tinypng_disabled_for_run = false;
 	private $tinypng_fallback_notice_shown = false;
 	private $tinypng_compression_count = null;
+	private $progress_active = false;
+	private $progress_completed = [];
+	private $progress_weights = [];
+	private $progress_jobs = [];
+	private $progress_engine_samples = [];
+	private $progress_total_weight = 0.0;
+	private $progress_completed_weight = 0.0;
+	private $progress_total_count = 0;
+	private $progress_started_at = 0.0;
+	private $progress_last_rendered_at = 0.0;
+	private $progress_rendered = false;
 
 	public function __invoke( $args, $assoc_args ) {
 		$action = $args[0] ?? null;
@@ -59,6 +73,17 @@ class Optimize_Images_Command {
 
 		if ( 'status' === $action ) {
 			$this->status();
+			return;
+		}
+
+		if ( 'audit' === $action ) {
+			$directory = $args[1] ?? null;
+
+			if ( ! $directory ) {
+				\WP_CLI::error( 'Please provide an images directory. Example: wp optimize-images audit ./images' );
+			}
+
+			$this->audit( $directory, $assoc_args );
 			return;
 		}
 
@@ -134,6 +159,7 @@ class Optimize_Images_Command {
 		\WP_CLI::log( 'Node.js: ' . ( $node_version ?: 'not found' ) );
 		\WP_CLI::log( 'Local optimizer: ' . ( $local_ready ? 'ready' : 'not installed' ) );
 		\WP_CLI::log( sprintf( 'Default resize: %d × %d px', self::DEFAULT_MAX_WIDTH, self::DEFAULT_MAX_HEIGHT ) );
+		\WP_CLI::log( sprintf( 'Default local quality: %d%%', self::DEFAULT_QUALITY ) );
 		\WP_CLI::log( 'Supported extensions: ' . implode( ', ', self::SUPPORTED_EXTENSIONS ) );
 		\WP_CLI::log( 'Config: ' . $config_file );
 		\WP_CLI::log( '' );
@@ -151,6 +177,145 @@ class Optimize_Images_Command {
 		\WP_CLI::warning( 'Node.js and npm are required when TinyPNG is not available.' );
 	}
 
+
+	private function audit( $directory, $assoc_args ) {
+		$source_dir = realpath( $directory );
+
+		if ( ! $source_dir || ! is_dir( $source_dir ) ) {
+			\WP_CLI::error( 'Directory does not exist.' );
+		}
+
+		$source_dir = $this->normalize_path( $source_dir );
+		$extensions = $this->get_extensions( $assoc_args['extensions'] ?? null );
+		$resize_settings = $this->get_resize_settings( $assoc_args );
+		$source_files = $this->collect_source_files( $source_dir, $extensions );
+
+		$total_size = 0;
+		$raster_count = 0;
+		$svg_count = 0;
+		$large_count = 0;
+		$oversized_count = 0;
+		$formats = [];
+		$largest = [];
+
+		foreach ( $source_files as $file ) {
+			$total_size += $file['size'];
+
+			if ( $file['size'] > self::AUDIT_LARGE_FILE_BYTES ) {
+				$large_count++;
+			}
+
+			if ( ! isset( $formats[ $file['extension'] ] ) ) {
+				$formats[ $file['extension'] ] = [
+					'count' => 0,
+					'size' => 0,
+				];
+			}
+
+			$formats[ $file['extension'] ]['count']++;
+			$formats[ $file['extension'] ]['size'] += $file['size'];
+
+			if ( 'svg' === $file['extension'] ) {
+				$svg_count++;
+			} else {
+				$raster_count++;
+				$this->hydrate_image_dimensions( $file, [
+					'enabled' => true,
+					'max_width' => self::DEFAULT_MAX_WIDTH,
+					'max_height' => self::DEFAULT_MAX_HEIGHT,
+				] );
+
+				if (
+					$resize_settings['enabled']
+					&& $this->should_resize( $file, $resize_settings )
+				) {
+					$oversized_count++;
+				}
+			}
+
+			$largest[] = $file;
+		}
+
+		usort(
+			$largest,
+			static fn( $a, $b ) => $b['size'] <=> $a['size']
+		);
+
+		$largest = array_slice( $largest, 0, self::AUDIT_TOP_FILES );
+		ksort( $formats );
+
+		\WP_CLI::log( "Source: {$source_dir}" );
+		\WP_CLI::log( 'Extensions: ' . implode( ',', $extensions ) );
+
+		if ( $resize_settings['enabled'] ) {
+			\WP_CLI::log(
+				sprintf(
+					'Resize threshold: %d × %d px',
+					$resize_settings['max_width'],
+					$resize_settings['max_height']
+				)
+			);
+		} else {
+			\WP_CLI::log( 'Resize threshold: disabled' );
+		}
+
+		\WP_CLI::log( '' );
+		\WP_CLI::log( 'Audit' );
+		\WP_CLI::log( '' );
+		\WP_CLI::log( sprintf( '  %-18s %d', 'Files:', count( $source_files ) ) );
+		\WP_CLI::log( sprintf( '  %-18s %d', 'Raster:', $raster_count ) );
+		\WP_CLI::log( sprintf( '  %-18s %d', 'SVG:', $svg_count ) );
+		\WP_CLI::log( sprintf( '  %-18s %s', 'Total size:', $this->format_bytes( $total_size ) ) );
+		\WP_CLI::log( sprintf( '  %-18s %d', 'Over 1 MB:', $large_count ) );
+
+		if ( $resize_settings['enabled'] ) {
+			\WP_CLI::log( sprintf( '  %-18s %d', 'Would resize:', $oversized_count ) );
+		}
+
+		if ( ! empty( $formats ) ) {
+			\WP_CLI::log( '' );
+			\WP_CLI::log( 'Formats' );
+
+			foreach ( $formats as $extension => $data ) {
+				\WP_CLI::log(
+					sprintf(
+						'  %-8s %4d  %s',
+						strtoupper( $extension ),
+						$data['count'],
+						$this->format_bytes( $data['size'] )
+					)
+				);
+			}
+		}
+
+		if ( ! empty( $largest ) ) {
+			\WP_CLI::log( '' );
+			\WP_CLI::log( sprintf( 'Largest files (top %d)', count( $largest ) ) );
+
+			foreach ( $largest as $file ) {
+				$details = 'svg' === $file['extension']
+					? 'SVG'
+					: (
+						! empty( $file['width'] ) && ! empty( $file['height'] )
+							? sprintf( '%d×%d', $file['width'], $file['height'] )
+							: 'dimensions unknown'
+					);
+
+				\WP_CLI::log(
+					sprintf(
+						'  %s  %s  %s',
+						$this->format_bytes( $file['size'] ),
+						$details,
+						$file['relative']
+					)
+				);
+			}
+		}
+
+		\WP_CLI::log( '' );
+		\WP_CLI::success( 'Audit complete. No files were changed.' );
+	}
+
 	private function optimize( $directory, $assoc_args, $sync ) {
 		$source_dir = realpath( $directory );
 
@@ -161,7 +326,7 @@ class Optimize_Images_Command {
 		$source_dir = $this->normalize_path( $source_dir );
 		$extensions = $this->get_extensions( $assoc_args['extensions'] ?? null );
 		$resize_settings = $this->get_resize_settings( $assoc_args );
-		$optimization_signature = $this->get_optimization_signature( $resize_settings );
+		$quality = $this->get_quality( $assoc_args );
 		$target_dir = $this->get_target_dir( $source_dir, $assoc_args['output'] ?? null );
 
 		if ( $this->is_same_or_child_path( $target_dir, $source_dir ) ) {
@@ -186,7 +351,7 @@ class Optimize_Images_Command {
 				$cache,
 				$extensions,
 				$resize_settings,
-				$optimization_signature,
+				$quality,
 				$force,
 				$sync
 			);
@@ -216,15 +381,17 @@ class Optimize_Images_Command {
 				? sprintf( 'Resize: max %d × %d px', $resize_settings['max_width'], $resize_settings['max_height'] )
 				: 'Resize: disabled'
 		);
+		\WP_CLI::log( sprintf( 'Local quality: %d%%', $quality ) );
 		\WP_CLI::log( '' );
 
 		$removed = 0;
+		$cache_dirty = false;
 
 		if ( $sync ) {
 			$removed = $this->remove_stale_files( $stale_files, $cache );
-			$this->prune_cache( $cache, $source_files, $extensions );
+			$pruned = $this->prune_cache( $cache, $source_files, $extensions );
 			$this->clean_empty_directories( $target_dir );
-			$this->save_cache( $cache_file, $cache );
+			$cache_dirty = $removed > 0 || $pruned > 0;
 		}
 
 		$pending = [];
@@ -232,17 +399,32 @@ class Optimize_Images_Command {
 
 		foreach ( $source_files as $cache_key => $file ) {
 			$target_file = $target_dir . '/' . $file['relative'];
+			$optimization_signature = $this->get_optimization_signature(
+				$resize_settings,
+				$quality,
+				$file['extension']
+			);
 
 			if (
 				! $force
 				&& file_exists( $target_file )
 				&& isset( $cache[ $cache_key ] )
-				&& $this->cache_matches( $cache[ $cache_key ], $file['hash'], $optimization_signature )
 			) {
-				\WP_CLI::log( "↷ {$file['relative']} (unchanged)" );
-				$skipped++;
-				continue;
+				$cache_entry = $cache[ $cache_key ];
+
+				if ( $this->cache_matches( $cache_entry, $file, $optimization_signature ) ) {
+					if ( $cache_entry !== $cache[ $cache_key ] ) {
+						$cache[ $cache_key ] = $cache_entry;
+						$cache_dirty = true;
+					}
+
+					\WP_CLI::log( "↷ {$file['relative']} (unchanged)" );
+					$skipped++;
+					continue;
+				}
 			}
+
+			$this->hydrate_image_dimensions( $file, $resize_settings );
 
 			$target_file_dir = dirname( $target_file );
 
@@ -250,16 +432,22 @@ class Optimize_Images_Command {
 				$pending[ $cache_key ] = [
 					'file' => $file,
 					'target' => $target_file,
+					'signature' => $optimization_signature,
 					'error' => 'Could not create output directory.',
 				];
 				continue;
 			}
 
+			$will_resize = $this->should_resize( $file, $resize_settings );
+
 			$pending[ $cache_key ] = [
 				'file' => $file,
 				'target' => $target_file,
-				'will_resize' => $this->should_resize( $file, $resize_settings ),
-				'target_dimensions' => $this->get_target_dimensions( $file, $resize_settings ),
+				'signature' => $optimization_signature,
+				'will_resize' => $will_resize,
+				'target_dimensions' => $will_resize
+					? $this->get_target_dimensions( $file, $resize_settings )
+					: null,
 			];
 		}
 
@@ -279,59 +467,66 @@ class Optimize_Images_Command {
 		}
 
 		if ( ! empty( $processable ) ) {
-			$svg_jobs = array_filter(
-				$processable,
-				static fn( $job ) => 'svg' === $job['file']['extension']
-			);
+			$this->start_progress( $processable, (bool) $api_key );
 
-			$raster_jobs = array_filter(
-				$processable,
-				static fn( $job ) => 'svg' !== $job['file']['extension']
-			);
-
-			if ( ! empty( $svg_jobs ) ) {
-				$results = array_replace(
-					$results,
-					$this->optimize_local_batch( $svg_jobs, $resize_settings )
+			try {
+				$svg_jobs = array_filter(
+					$processable,
+					static fn( $job ) => 'svg' === $job['file']['extension']
 				);
-			}
 
-			if ( ! empty( $raster_jobs ) ) {
-				if ( $api_key ) {
-					$tinypng_jobs = $this->prepare_tinypng_jobs(
-						$raster_jobs,
-						$resize_settings
+				$raster_jobs = array_filter(
+					$processable,
+					static fn( $job ) => 'svg' !== $job['file']['extension']
+				);
+
+				if ( ! empty( $svg_jobs ) ) {
+					$results = array_replace(
+						$results,
+						$this->optimize_local_batch( $svg_jobs, $resize_settings, $quality )
 					);
+				}
 
-					$tinypng_results = $this->optimize_tinypng_batch(
-						$tinypng_jobs['jobs'],
-						$api_key
-					);
-
-					$results = array_replace( $results, $tinypng_results['results'] );
-					$fallback_keys = $tinypng_results['fallback_keys'];
-
-					$this->cleanup_temp_directory( $tinypng_jobs['temp_dir'] );
-
-					if ( ! empty( $fallback_keys ) ) {
-						$fallback_jobs = array_intersect_key(
+				if ( ! empty( $raster_jobs ) ) {
+					if ( $api_key ) {
+						$tinypng_jobs = $this->prepare_tinypng_jobs(
 							$raster_jobs,
-							array_fill_keys( $fallback_keys, true )
-						);
-
-						$local_results = $this->optimize_local_batch(
-							$fallback_jobs,
 							$resize_settings
 						);
 
-						$results = array_replace( $results, $local_results );
+						$tinypng_results = $this->optimize_tinypng_batch(
+							$tinypng_jobs['jobs'],
+							$api_key
+						);
+
+						$results = array_replace( $results, $tinypng_results['results'] );
+						$fallback_keys = $tinypng_results['fallback_keys'];
+
+						$this->cleanup_temp_directory( $tinypng_jobs['temp_dir'] );
+
+						if ( ! empty( $fallback_keys ) ) {
+							$fallback_jobs = array_intersect_key(
+								$raster_jobs,
+								array_fill_keys( $fallback_keys, true )
+							);
+
+							$local_results = $this->optimize_local_batch(
+								$fallback_jobs,
+								$resize_settings,
+								$quality
+							);
+
+							$results = array_replace( $results, $local_results );
+						}
+					} else {
+						$results = array_replace(
+							$results,
+							$this->optimize_local_batch( $raster_jobs, $resize_settings, $quality )
+						);
 					}
-				} else {
-					$results = array_replace(
-						$results,
-						$this->optimize_local_batch( $raster_jobs, $resize_settings )
-					);
 				}
+			} finally {
+				$this->finish_progress();
 			}
 		}
 
@@ -340,6 +535,7 @@ class Optimize_Images_Command {
 		$failed = 0;
 		$original_size = 0;
 		$output_size = 0;
+		$file_results = [];
 
 		foreach ( $pending as $cache_key => $job ) {
 			$file = $job['file'];
@@ -363,6 +559,14 @@ class Optimize_Images_Command {
 				continue;
 			}
 
+			try {
+				$source_hash = $this->get_file_hash( $file );
+			} catch ( \Exception $e ) {
+				\WP_CLI::warning( "{$file['relative']}: {$e->getMessage()}" );
+				$failed++;
+				continue;
+			}
+
 			$saved = max( 0, $before - $after );
 			$optimized++;
 			$original_size += $before;
@@ -373,15 +577,18 @@ class Optimize_Images_Command {
 			}
 
 			$cache[ $cache_key ] = [
-				'hash' => $file['hash'],
-				'signature' => $optimization_signature,
+				'hash' => $source_hash,
+				'signature' => $job['signature'],
+				'size' => $file['size'],
+				'mtime' => $file['mtime'],
 			];
+			$cache_dirty = true;
 
-			$resize_label = '';
+			$resize_label = '—';
 
 			if ( ! empty( $job['will_resize'] ) && ! empty( $job['target_dimensions'] ) ) {
 				$resize_label = sprintf(
-					' [%d×%d → %d×%d]',
+					'%d×%d → %d×%d',
 					$file['width'],
 					$file['height'],
 					$job['target_dimensions']['width'],
@@ -389,19 +596,22 @@ class Optimize_Images_Command {
 				);
 			}
 
-			\WP_CLI::log(
-				sprintf(
-					'✓ %s%s  %s → %s (-%s)',
-					$file['relative'],
-					$resize_label,
-					$this->format_bytes( $before ),
-					$this->format_bytes( $after ),
-					$before > 0 ? round( ( $saved / $before ) * 100 ) . '%' : '0%'
-				)
-			);
+			$file_results[] = [
+				'File' => $this->truncate_table_value( $file['relative'], 50 ),
+				'Resize' => $resize_label,
+				'Before' => $this->format_bytes( $before ),
+				'After' => $this->format_bytes( $after ),
+				'Saved' => $before > 0
+					? round( ( $saved / $before ) * 100 ) . '%'
+					: '0%',
+			];
 		}
 
-		$this->save_cache( $cache_file, $cache );
+		if ( $cache_dirty ) {
+			$this->save_cache( $cache_file, $cache );
+		}
+
+		$this->print_file_results( $file_results );
 
 		$this->print_summary(
 			count( $source_files ),
@@ -452,7 +662,7 @@ class Optimize_Images_Command {
 		}
 
 		if ( ! empty( $resize_jobs ) ) {
-			$resize_results = $this->run_local_batch( $resize_jobs );
+			$resize_results = $this->run_local_batch( $resize_jobs, false );
 
 			foreach ( $resize_jobs as $cache_key => $resize_job ) {
 				$result = $resize_results[ $cache_key ] ?? null;
@@ -490,6 +700,12 @@ class Optimize_Images_Command {
 			if ( $this->tinypng_disabled_for_run ) {
 				$fallback_keys = array_merge( $fallback_keys, array_keys( $chunk ) );
 				continue;
+			}
+
+			foreach ( $chunk as $cache_key => $job ) {
+				if ( empty( $job['preprocess_error'] ) ) {
+					$this->start_progress_job( $cache_key, 'tinypng' );
+				}
 			}
 
 			$upload_results = $this->tinypng_upload_chunk( $chunk, $api_key );
@@ -698,6 +914,7 @@ class Optimize_Images_Command {
 				];
 			} else {
 				$results[ $cache_key ] = [ 'success' => true ];
+				$this->tick_progress( $cache_key );
 			}
 
 			curl_multi_remove_handle( $multi, $ch );
@@ -713,13 +930,15 @@ class Optimize_Images_Command {
 
 		do {
 			$status = curl_multi_exec( $multi, $running );
+			$this->heartbeat_progress();
 
 			if ( CURLM_OK !== $status ) {
 				break;
 			}
 
 			if ( $running > 0 ) {
-				$selected = curl_multi_select( $multi, 1.0 );
+				$selected = curl_multi_select( $multi, 0.25 );
+				$this->heartbeat_progress();
 
 				if ( -1 === $selected ) {
 					usleep( 10000 );
@@ -735,16 +954,18 @@ class Optimize_Images_Command {
 			return;
 		}
 
+		$this->clear_progress_line();
 		\WP_CLI::warning(
 			'TinyPNG is unavailable ('
 			. $message
 			. '). Switching to the free local optimizer.'
 		);
+		$this->render_progress( true );
 
 		$this->tinypng_fallback_notice_shown = true;
 	}
 
-	private function optimize_local_batch( $jobs, $resize_settings ) {
+	private function optimize_local_batch( $jobs, $resize_settings, $quality ) {
 		if ( empty( $jobs ) ) {
 			return [];
 		}
@@ -764,10 +985,11 @@ class Optimize_Images_Command {
 				'input' => $job['file']['source'],
 				'output' => $temp_target,
 				'extension' => $job['file']['extension'],
-				'max_width' => ! $is_svg && $resize_settings['enabled']
+				'quality' => $quality,
+				'max_width' => ! $is_svg && ! empty( $job['will_resize'] )
 					? $resize_settings['max_width']
 					: 0,
-				'max_height' => ! $is_svg && $resize_settings['enabled']
+				'max_height' => ! $is_svg && ! empty( $job['will_resize'] )
 					? $resize_settings['max_height']
 					: 0,
 			];
@@ -847,7 +1069,7 @@ class Optimize_Images_Command {
 		return $results;
 	}
 
-	private function run_local_batch( $jobs ) {
+	private function run_local_batch( $jobs, $track_progress = true ) {
 		if ( empty( $jobs ) ) {
 			return [];
 		}
@@ -861,7 +1083,7 @@ class Optimize_Images_Command {
 		}
 
 		$manifest = [
-			'concurrency' => self::LOCAL_BATCH_CONCURRENCY,
+			'concurrency' => $this->get_local_batch_concurrency(),
 			'jobs' => [],
 		];
 
@@ -881,22 +1103,120 @@ class Optimize_Images_Command {
 		}
 
 		$command = sprintf(
-			'node %s batch %s %s 2>&1',
+			'node %s batch %s %s',
 			escapeshellarg( $this->get_local_optimizer_script() ),
 			escapeshellarg( $manifest_file ),
 			escapeshellarg( $result_file )
 		);
 
-		$output = [];
-		$status = 0;
-		exec( $command, $output, $status );
+		$descriptors = [
+			0 => [ 'pipe', 'r' ],
+			1 => [ 'pipe', 'w' ],
+			2 => [ 'pipe', 'w' ],
+		];
+
+		$process = proc_open( $command, $descriptors, $pipes );
+
+		if ( ! is_resource( $process ) ) {
+			@unlink( $manifest_file );
+			@unlink( $result_file );
+			throw new \RuntimeException( 'Could not start local batch optimizer.' );
+		}
+
+		fclose( $pipes[0] );
+		stream_set_blocking( $pipes[1], false );
+		stream_set_blocking( $pipes[2], false );
+
+		$stdout_buffer = '';
+		$stderr = '';
+		$last_status = null;
+
+		$consume_stdout = function ( $chunk ) use ( &$stdout_buffer, $track_progress, $jobs ) {
+			if ( '' === $chunk ) {
+				return;
+			}
+
+			$stdout_buffer .= $chunk;
+
+			while ( false !== ( $newline = strpos( $stdout_buffer, "\n" ) ) ) {
+				$line = trim( substr( $stdout_buffer, 0, $newline ) );
+				$stdout_buffer = substr( $stdout_buffer, $newline + 1 );
+
+				if ( ! $track_progress ) {
+					continue;
+				}
+
+				if ( str_starts_with( $line, 'WP_OPTIMIZE_START:' ) ) {
+					$cache_key = substr( $line, strlen( 'WP_OPTIMIZE_START:' ) );
+					$job = $jobs[ $cache_key ] ?? [];
+					$engine = 'svg-optimize' === ( $job['mode'] ?? '' )
+						? 'svg'
+						: 'local';
+
+					$this->start_progress_job( $cache_key, $engine );
+					continue;
+				}
+
+				if ( str_starts_with( $line, 'WP_OPTIMIZE_PROGRESS:' ) ) {
+					$this->tick_progress( substr( $line, strlen( 'WP_OPTIMIZE_PROGRESS:' ) ) );
+				}
+			}
+		};
+
+		do {
+			$last_status = proc_get_status( $process );
+			$consume_stdout( (string) stream_get_contents( $pipes[1] ) );
+			$stderr .= (string) stream_get_contents( $pipes[2] );
+
+			$this->heartbeat_progress();
+
+			if ( ! $last_status['running'] ) {
+				break;
+			}
+
+			usleep( 50000 );
+		} while ( true );
+
+		$consume_stdout( (string) stream_get_contents( $pipes[1] ) );
+		$stderr .= (string) stream_get_contents( $pipes[2] );
+
+		if ( '' !== trim( $stdout_buffer ) && $track_progress ) {
+			$line = trim( $stdout_buffer );
+
+			if ( str_starts_with( $line, 'WP_OPTIMIZE_START:' ) ) {
+				$cache_key = substr( $line, strlen( 'WP_OPTIMIZE_START:' ) );
+				$job = $jobs[ $cache_key ] ?? [];
+				$engine = 'svg-optimize' === ( $job['mode'] ?? '' )
+					? 'svg'
+					: 'local';
+
+				$this->start_progress_job( $cache_key, $engine );
+			} elseif ( str_starts_with( $line, 'WP_OPTIMIZE_PROGRESS:' ) ) {
+				$this->tick_progress( substr( $line, strlen( 'WP_OPTIMIZE_PROGRESS:' ) ) );
+			}
+		}
+
+		fclose( $pipes[1] );
+		fclose( $pipes[2] );
+
+		$exit_code = proc_close( $process );
+
+		if (
+			-1 === $exit_code
+			&& is_array( $last_status )
+			&& isset( $last_status['exitcode'] )
+			&& $last_status['exitcode'] >= 0
+		) {
+			$exit_code = $last_status['exitcode'];
+		}
+
 		@unlink( $manifest_file );
 
-		if ( 0 !== $status || ! file_exists( $result_file ) ) {
+		if ( 0 !== $exit_code || ! file_exists( $result_file ) ) {
 			@unlink( $result_file );
 			throw new \RuntimeException(
-				! empty( $output )
-					? trim( implode( ' ', $output ) )
+				'' !== trim( $stderr )
+					? trim( $stderr )
 					: 'Local batch optimization failed.'
 			);
 		}
@@ -1100,7 +1420,7 @@ class Optimize_Images_Command {
 		$cache,
 		$extensions,
 		$resize_settings,
-		$optimization_signature,
+		$quality,
 		$force,
 		$sync
 	) {
@@ -1112,6 +1432,7 @@ class Optimize_Images_Command {
 				? sprintf( 'Resize: max %d × %d px', $resize_settings['max_width'], $resize_settings['max_height'] )
 				: 'Resize: disabled'
 		);
+		\WP_CLI::log( sprintf( 'Local quality: %d%%', $quality ) );
 		\WP_CLI::log( 'Mode: dry-run' );
 		\WP_CLI::log( '' );
 
@@ -1123,18 +1444,27 @@ class Optimize_Images_Command {
 		foreach ( $source_files as $cache_key => $file ) {
 			$target_file = $target_dir . '/' . $file['relative'];
 			$total_size += $file['size'];
+			$optimization_signature = $this->get_optimization_signature(
+				$resize_settings,
+				$quality,
+				$file['extension']
+			);
 
 			if (
 				! $force
 				&& file_exists( $target_file )
 				&& isset( $cache[ $cache_key ] )
-				&& $this->cache_matches( $cache[ $cache_key ], $file['hash'], $optimization_signature )
 			) {
-				\WP_CLI::log( "↷ {$file['relative']} (unchanged)" );
-				$unchanged++;
-				continue;
+				$cache_entry = $cache[ $cache_key ];
+
+				if ( $this->cache_matches( $cache_entry, $file, $optimization_signature ) ) {
+					\WP_CLI::log( "↷ {$file['relative']} (unchanged)" );
+					$unchanged++;
+					continue;
+				}
 			}
 
+			$this->hydrate_image_dimensions( $file, $resize_settings );
 			$resize_label = '';
 
 			if ( $this->should_resize( $file, $resize_settings ) ) {
@@ -1179,6 +1509,474 @@ class Optimize_Images_Command {
 		\WP_CLI::success( 'Dry run complete. No files were changed.' );
 	}
 
+	private function start_progress( $jobs, $tinypng_available ) {
+		if ( empty( $jobs ) ) {
+			return;
+		}
+
+		if ( class_exists( '\\cli\\Shell' ) && \cli\Shell::isPiped() ) {
+			return;
+		}
+
+		$this->progress_active = true;
+		$this->progress_completed = [];
+		$this->progress_weights = [];
+		$this->progress_jobs = [];
+		$this->progress_engine_samples = [];
+		$this->progress_total_weight = 0.0;
+		$this->progress_completed_weight = 0.0;
+		$this->progress_total_count = count( $jobs );
+		$this->progress_started_at = microtime( true );
+		$this->progress_last_rendered_at = 0.0;
+		$this->progress_rendered = false;
+
+		foreach ( $jobs as $cache_key => $job ) {
+			$cache_key = (string) $cache_key;
+			$weight = $this->get_progress_weight( $job );
+			$extension = $job['file']['extension'] ?? '';
+			$engine = 'svg' === $extension
+				? 'svg'
+				: ( $tinypng_available ? 'tinypng' : 'local' );
+
+			$this->progress_weights[ $cache_key ] = $weight;
+			$this->progress_jobs[ $cache_key ] = [
+				'engine' => $engine,
+				'weight' => $weight,
+				'started_at' => null,
+				'completed_at' => null,
+			];
+			$this->progress_total_weight += $weight;
+		}
+
+		$this->render_progress( true );
+	}
+
+	private function get_progress_weight( $job ) {
+		$size = max(
+			1,
+			(int) ( $job['file']['size'] ?? 1 )
+		);
+
+		$size_mb = max(
+			0.01,
+			$size / 1048576
+		);
+
+		if ( 'svg' === ( $job['file']['extension'] ?? '' ) ) {
+			return 0.90 + min(
+				0.25,
+				log( 1 + $size_mb, 2 ) * 0.08
+			);
+		}
+
+		$weight = 1.0 + min(
+			0.50,
+			log( 1 + $size_mb, 2 ) * 0.15
+		);
+
+		if ( ! empty( $job['will_resize'] ) ) {
+			$weight *= 1.08;
+		}
+
+		return $weight;
+	}
+
+	private function start_progress_job( $cache_key, $engine ) {
+		if ( ! $this->progress_active ) {
+			return;
+		}
+
+		$cache_key = (string) $cache_key;
+
+		if (
+			! isset( $this->progress_jobs[ $cache_key ] )
+			|| isset( $this->progress_completed[ $cache_key ] )
+		) {
+			return;
+		}
+
+		/*
+		 * A TinyPNG failure can restart the same job through the local fallback.
+		 * Reset the timer so failed network time does not pollute local samples.
+		 */
+		$this->progress_jobs[ $cache_key ]['engine'] = $engine;
+		$this->progress_jobs[ $cache_key ]['started_at'] = microtime( true );
+		$this->progress_jobs[ $cache_key ]['completed_at'] = null;
+		$this->render_progress( true );
+	}
+
+	private function tick_progress( $cache_key ) {
+		if ( ! $this->progress_active ) {
+			return;
+		}
+
+		$cache_key = (string) $cache_key;
+
+		if ( isset( $this->progress_completed[ $cache_key ] ) ) {
+			return;
+		}
+
+		$now = microtime( true );
+		$job = $this->progress_jobs[ $cache_key ] ?? null;
+
+		if ( is_array( $job ) ) {
+			$started_at = $job['started_at'] ?? null;
+			$engine = $job['engine'] ?? 'local';
+			$weight = max( 0.0001, (float) ( $job['weight'] ?? 1.0 ) );
+
+			if ( is_numeric( $started_at ) && $started_at > 0 ) {
+				$duration = max( 0.001, $now - $started_at );
+				$seconds_per_weight = $duration / $weight;
+
+				if ( ! isset( $this->progress_engine_samples[ $engine ] ) ) {
+					$this->progress_engine_samples[ $engine ] = [];
+				}
+
+				$this->progress_engine_samples[ $engine ][] = $seconds_per_weight;
+
+				if ( count( $this->progress_engine_samples[ $engine ] ) > 20 ) {
+					array_shift( $this->progress_engine_samples[ $engine ] );
+				}
+			}
+
+			$this->progress_jobs[ $cache_key ]['completed_at'] = $now;
+		}
+
+		$this->progress_completed[ $cache_key ] = true;
+		$this->progress_completed_weight += $this->progress_weights[ $cache_key ] ?? 1.0;
+		$this->render_progress( true );
+	}
+
+	private function get_progress_engine_rate( $engine ) {
+		$samples = $this->progress_engine_samples[ $engine ] ?? [];
+
+		if ( empty( $samples ) ) {
+			return null;
+		}
+
+		sort( $samples, SORT_NUMERIC );
+		$count = count( $samples );
+		$middle = intdiv( $count, 2 );
+
+		if ( 1 === $count % 2 ) {
+			return (float) $samples[ $middle ];
+		}
+
+		return (
+			(float) $samples[ $middle - 1 ]
+			+ (float) $samples[ $middle ]
+		) / 2;
+	}
+
+	private function get_progress_engine_slots( $engine ) {
+		if ( 'tinypng' === $engine ) {
+			return self::TINYPNG_CONCURRENCY;
+		}
+
+		return $this->get_local_batch_concurrency();
+	}
+
+	private function get_critical_path_eta() {
+		if ( ! $this->progress_active ) {
+			return null;
+		}
+
+		$completed_count = count( $this->progress_completed );
+
+		if ( $completed_count >= $this->progress_total_count ) {
+			return 0.0;
+		}
+
+		$minimum_completed = $this->progress_total_count <= 8
+			? min( 3, $this->progress_total_count )
+			: min( 2, $this->progress_total_count );
+
+		if ( $completed_count < $minimum_completed ) {
+			return null;
+		}
+
+		$now = microtime( true );
+		$engine_jobs = [];
+
+		foreach ( $this->progress_jobs as $cache_key => $job ) {
+			if ( isset( $this->progress_completed[ $cache_key ] ) ) {
+				continue;
+			}
+
+			$engine = $job['engine'] ?? 'local';
+
+			if ( ! isset( $engine_jobs[ $engine ] ) ) {
+				$engine_jobs[ $engine ] = [
+					'active' => [],
+					'queued' => [],
+				];
+			}
+
+			$rate = $this->get_progress_engine_rate( $engine );
+
+			if ( null === $rate ) {
+				return null;
+			}
+
+			$predicted = max(
+				0.25,
+				$rate * max( 0.0001, (float) ( $job['weight'] ?? 1.0 ) )
+			);
+			$started_at = $job['started_at'] ?? null;
+
+			if ( is_numeric( $started_at ) && $started_at > 0 ) {
+				$elapsed = max( 0.0, $now - $started_at );
+
+				/*
+				 * Count down normally. If a job outlives its estimate, keep only a
+				 * small tail buffer instead of letting ETA explode upwards.
+				 */
+				$remaining = $predicted - $elapsed;
+
+				if ( $remaining <= 0 ) {
+					$remaining = min(
+						5.0,
+						max( 1.0, $predicted * 0.20 )
+					);
+				}
+
+				$engine_jobs[ $engine ]['active'][] = $remaining;
+			} else {
+				$engine_jobs[ $engine ]['queued'][] = $predicted;
+			}
+		}
+
+		$total_eta = 0.0;
+
+		foreach ( $engine_jobs as $engine => $group ) {
+			$slots = max( 1, $this->get_progress_engine_slots( $engine ) );
+			$slot_loads = array_fill( 0, $slots, 0.0 );
+			$active = $group['active'];
+			$queued = $group['queued'];
+
+			/*
+			 * Active jobs already occupy workers. Put the longest remaining jobs
+			 * first to produce a stable upper-bound approximation of the phase.
+			 */
+			rsort( $active, SORT_NUMERIC );
+
+			foreach ( array_slice( $active, 0, $slots ) as $index => $remaining ) {
+				$slot_loads[ $index ] = $remaining;
+			}
+
+			foreach ( $queued as $duration ) {
+				$slot_index = array_search( min( $slot_loads ), $slot_loads, true );
+
+				if ( false === $slot_index ) {
+					$slot_index = 0;
+				}
+
+				$slot_loads[ $slot_index ] += $duration;
+			}
+
+			$total_eta += max( $slot_loads );
+		}
+
+		return max( 0.0, $total_eta );
+	}
+
+	private function heartbeat_progress() {
+		$this->render_progress();
+	}
+
+	private function render_progress( $force = false ) {
+		if ( ! $this->progress_active ) {
+			return;
+		}
+
+		$now = microtime( true );
+
+		if (
+			! $force
+			&& $now - $this->progress_last_rendered_at < 1.0
+		) {
+			return;
+		}
+
+		$this->progress_last_rendered_at = $now;
+
+		$elapsed = max(
+			0.0,
+			$now - $this->progress_started_at
+		);
+
+		$completed_count = count( $this->progress_completed );
+		$total_weight = max( 0.0001, $this->progress_total_weight );
+		$completed_weight = min(
+			$total_weight,
+			$this->progress_completed_weight
+		);
+		$fraction = min(
+			1.0,
+			$completed_weight / $total_weight
+		);
+		$percent = (int) floor( $fraction * 100 );
+		$bar_width = 20;
+		$filled = (int) round( $fraction * $bar_width );
+		$filled = max( 0, min( $bar_width, $filled ) );
+		$bar = str_repeat( '█', $filled )
+			. str_repeat( '░', $bar_width - $filled );
+
+		$eta = $this->get_critical_path_eta();
+		if ( $completed_count >= $this->progress_total_count ) {
+			$percent = 100;
+			$bar = str_repeat( '█', $bar_width );
+		}
+
+		$spinner_frames = [ '|', '/', '-', '\\' ];
+		$spinner_index = (int) floor( $elapsed * 4 ) % count( $spinner_frames );
+		$spinner = $spinner_frames[ $spinner_index ];
+
+		$eta_value = null === $eta
+			? 'calculating...'
+			: '~' . $this->format_progress_duration( (int) ceil( $eta ) );
+
+		if ( $completed_count >= $this->progress_total_count ) {
+			$eta_value = '0:00';
+		}
+
+		$lines = [
+			sprintf(
+				'Optimizing images · %d/%d',
+				$completed_count,
+				$this->progress_total_count
+			),
+			sprintf(
+				'%s  %d%%',
+				$bar,
+				$percent
+			),
+			sprintf(
+				'%s elapsed · ETA %s %s',
+				$this->format_progress_duration( (int) floor( $elapsed ) ),
+				$eta_value,
+				$spinner
+			),
+		];
+
+		if ( $this->progress_rendered ) {
+			$this->erase_progress_lines();
+		}
+
+		fwrite(
+			STDOUT,
+			implode( PHP_EOL, $lines )
+		);
+
+		$this->progress_rendered = true;
+	}
+
+	private function erase_progress_lines() {
+		/*
+		 * The cursor sits on the third progress line. Clear it, move up,
+		 * clear the second line, then move up and clear the first line.
+		 */
+		fwrite(
+			STDOUT,
+			"\r\033[2K"
+			. "\033[1A\r\033[2K"
+			. "\033[1A\r\033[2K"
+		);
+	}
+
+	private function clear_progress_line() {
+		if (
+			! $this->progress_active
+			|| ! $this->progress_rendered
+		) {
+			return;
+		}
+
+		$this->erase_progress_lines();
+		$this->progress_rendered = false;
+	}
+
+	private function finish_progress() {
+		if ( ! $this->progress_active ) {
+			return;
+		}
+
+		foreach ( array_keys( $this->progress_weights ) as $cache_key ) {
+			$this->progress_completed[ $cache_key ] = true;
+		}
+
+		$this->progress_completed_weight = $this->progress_total_weight;
+		$this->render_progress( true );
+		fwrite( STDOUT, PHP_EOL );
+
+		$this->progress_active = false;
+		$this->progress_completed = [];
+		$this->progress_weights = [];
+		$this->progress_jobs = [];
+		$this->progress_engine_samples = [];
+		$this->progress_total_weight = 0.0;
+		$this->progress_completed_weight = 0.0;
+		$this->progress_total_count = 0;
+		$this->progress_started_at = 0.0;
+		$this->progress_last_rendered_at = 0.0;
+		$this->progress_rendered = false;
+	}
+
+	private function format_progress_duration( $seconds ) {
+		$seconds = max( 0, (int) $seconds );
+		$hours = intdiv( $seconds, 3600 );
+		$minutes = intdiv( $seconds % 3600, 60 );
+		$remaining_seconds = $seconds % 60;
+
+		if ( $hours > 0 ) {
+			return sprintf(
+				'%d:%02d:%02d',
+				$hours,
+				$minutes,
+				$remaining_seconds
+			);
+		}
+
+		return sprintf(
+			'%d:%02d',
+			$minutes,
+			$remaining_seconds
+		);
+	}
+
+	private function print_file_results( $file_results ) {
+		if ( empty( $file_results ) ) {
+			return;
+		}
+
+		\WP_CLI::log( '' );
+		\WP_CLI::log( 'Results' );
+
+		\WP_CLI\Utils\format_items(
+			'table',
+			$file_results,
+			[
+				'File',
+				'Resize',
+				'Before',
+				'After',
+				'Saved',
+			]
+		);
+	}
+
+	private function truncate_table_value( $value, $max_length ) {
+		if ( strlen( $value ) <= $max_length ) {
+			return $value;
+		}
+
+		$extension = pathinfo( $value, PATHINFO_EXTENSION );
+		$suffix = $extension ? '.' . $extension : '';
+		$available = max( 1, $max_length - strlen( $suffix ) - 1 );
+
+		return substr( $value, 0, $available ) . '…' . $suffix;
+	}
+
 	private function print_summary(
 		$found,
 		$optimized,
@@ -1194,28 +1992,42 @@ class Optimize_Images_Command {
 		$saved_percent = $original_size > 0
 			? round( ( $total_saved / $original_size ) * 100 )
 			: 0;
+		$separator = str_repeat( '─', 28 );
 
 		\WP_CLI::log( '' );
-		\WP_CLI::log( 'Optimization complete' );
+		\WP_CLI::log( 'Summary' );
+		\WP_CLI::log( $separator );
 		\WP_CLI::log( '' );
+
 		\WP_CLI::log( 'Files' );
-		\WP_CLI::log( sprintf( '  %-12s %d', 'Found:', $found ) );
-		\WP_CLI::log( sprintf( '  %-12s %d', 'Optimized:', $optimized ) );
-		\WP_CLI::log( sprintf( '  %-12s %d', 'Resized:', $resized ) );
-		\WP_CLI::log( sprintf( '  %-12s %d', 'Skipped:', $skipped ) );
+		\WP_CLI::log( sprintf( '  %d total', $found ) );
+		\WP_CLI::log( sprintf( '  %d optimized', $optimized ) );
+		\WP_CLI::log( sprintf( '  %d resized', $resized ) );
+		\WP_CLI::log( sprintf( '  %d skipped', $skipped ) );
 
 		if ( $sync ) {
-			\WP_CLI::log( sprintf( '  %-12s %d', 'Removed:', $removed ) );
+			\WP_CLI::log( sprintf( '  %d removed', $removed ) );
 		}
 
-		\WP_CLI::log( sprintf( '  %-12s %d', 'Failed:', $failed ) );
+		\WP_CLI::log( sprintf( '  %d failed', $failed ) );
 
 		if ( $optimized > 0 ) {
 			\WP_CLI::log( '' );
 			\WP_CLI::log( 'Size' );
-			\WP_CLI::log( sprintf( '  %-12s %s', 'Before:', $this->format_bytes( $original_size ) ) );
-			\WP_CLI::log( sprintf( '  %-12s %s', 'After:', $this->format_bytes( $output_size ) ) );
-			\WP_CLI::log( sprintf( '  %-12s %s (%d%%)', 'Saved:', $this->format_bytes( $total_saved ), $saved_percent ) );
+			\WP_CLI::log(
+				sprintf(
+					'  %s → %s',
+					$this->format_bytes( $original_size ),
+					$this->format_bytes( $output_size )
+				)
+			);
+			\WP_CLI::log(
+				sprintf(
+					'  Saved %s (%d%%)',
+					$this->format_bytes( $total_saved ),
+					$saved_percent
+				)
+			);
 		}
 
 		if ( null !== $this->tinypng_compression_count ) {
@@ -1228,15 +2040,16 @@ class Optimize_Images_Command {
 			\WP_CLI::log( 'TinyPNG' );
 			\WP_CLI::log(
 				sprintf(
-					'  %-12s %d / %d',
-					'Used:',
+					'  %d / %d used',
 					$this->tinypng_compression_count,
 					self::TINIFY_FREE_MONTHLY_COMPRESSIONS
 				)
 			);
-			\WP_CLI::log( sprintf( '  %-12s %d free compressions', 'Remaining:', $remaining ) );
+			\WP_CLI::log( sprintf( '  %d remaining', $remaining ) );
 		}
 
+		\WP_CLI::log( '' );
+		\WP_CLI::log( $separator );
 		\WP_CLI::log( '' );
 
 		if ( $failed > 0 ) {
@@ -1274,16 +2087,16 @@ class Optimize_Images_Command {
 			$relative = $this->normalize_relative_path(
 				substr( $source_file, strlen( $source_dir ) + 1 )
 			);
-			$dimensions = $this->get_image_dimensions( $source_file );
 
 			$files[ $relative ] = [
 				'source' => $source_file,
 				'relative' => $relative,
 				'extension' => $extension,
-				'size' => filesize( $source_file ),
-				'hash' => hash_file( 'sha256', $source_file ),
-				'width' => $dimensions['width'] ?? null,
-				'height' => $dimensions['height'] ?? null,
+				'size' => $file->getSize(),
+				'mtime' => $file->getMTime(),
+				'hash' => null,
+				'width' => null,
+				'height' => null,
 			];
 		}
 
@@ -1344,6 +2157,8 @@ class Optimize_Images_Command {
 	}
 
 	private function prune_cache( &$cache, $source_files, $extensions ) {
+		$pruned = 0;
+
 		foreach ( array_keys( $cache ) as $relative ) {
 			$extension = strtolower( pathinfo( $relative, PATHINFO_EXTENSION ) );
 
@@ -1353,8 +2168,11 @@ class Optimize_Images_Command {
 
 			if ( ! isset( $source_files[ $relative ] ) ) {
 				unset( $cache[ $relative ] );
+				$pruned++;
 			}
 		}
+
+		return $pruned;
 	}
 
 	private function clean_empty_directories( $target_dir ) {
@@ -1438,6 +2256,26 @@ class Optimize_Images_Command {
 		];
 	}
 
+	private function hydrate_image_dimensions( &$file, $resize_settings ) {
+		if (
+			'svg' === $file['extension']
+			|| ! $resize_settings['enabled']
+			|| null !== $file['width']
+			|| null !== $file['height']
+		) {
+			return;
+		}
+
+		$dimensions = $this->get_image_dimensions( $file['source'] );
+
+		if ( ! $dimensions ) {
+			return;
+		}
+
+		$file['width'] = $dimensions['width'];
+		$file['height'] = $dimensions['height'];
+	}
+
 	private function should_resize( $file, $resize_settings ) {
 		if (
 			! $resize_settings['enabled']
@@ -1472,26 +2310,85 @@ class Optimize_Images_Command {
 		];
 	}
 
-	private function get_optimization_signature( $resize_settings ) {
+	private function get_optimization_signature( $resize_settings, $quality, $extension ) {
+		if ( 'svg' === $extension ) {
+			return sprintf( 'v%d|svg', self::PROCESSING_VERSION );
+		}
+
 		if ( ! $resize_settings['enabled'] ) {
-			return sprintf( 'v%d|resize:none', self::PROCESSING_VERSION );
+			return sprintf(
+				'v%d|resize:none|quality:%d',
+				self::PROCESSING_VERSION,
+				$quality
+			);
 		}
 
 		return sprintf(
-			'v%d|resize:%dx%d',
+			'v%d|resize:%dx%d|quality:%d',
 			self::PROCESSING_VERSION,
 			$resize_settings['max_width'],
-			$resize_settings['max_height']
+			$resize_settings['max_height'],
+			$quality
 		);
 	}
 
-	private function cache_matches( $cache_entry, $source_hash, $optimization_signature ) {
-		if ( ! is_array( $cache_entry ) || empty( $cache_entry['hash'] ) || empty( $cache_entry['signature'] ) ) {
+	private function get_quality( $assoc_args ) {
+		$value = $assoc_args['quality'] ?? self::DEFAULT_QUALITY;
+
+		if (
+			! ctype_digit( (string) $value )
+			|| (int) $value < 1
+			|| (int) $value > 100
+		) {
+			\WP_CLI::error( '--quality must be an integer between 1 and 100.' );
+		}
+
+		return (int) $value;
+	}
+
+	private function get_file_hash( &$file ) {
+		if ( ! empty( $file['hash'] ) ) {
+			return $file['hash'];
+		}
+
+		$hash = hash_file( 'sha256', $file['source'] );
+
+		if ( false === $hash ) {
+			throw new \RuntimeException( "Could not hash source file: {$file['relative']}" );
+		}
+
+		$file['hash'] = $hash;
+		return $hash;
+	}
+
+	private function cache_matches( &$cache_entry, &$file, $optimization_signature ) {
+		if (
+			! is_array( $cache_entry )
+			|| empty( $cache_entry['hash'] )
+			|| empty( $cache_entry['signature'] )
+			|| ! hash_equals( $cache_entry['signature'], $optimization_signature )
+		) {
 			return false;
 		}
 
-		return hash_equals( $cache_entry['hash'], $source_hash )
-			&& hash_equals( $cache_entry['signature'], $optimization_signature );
+		if (
+			isset( $cache_entry['size'], $cache_entry['mtime'] )
+			&& (int) $cache_entry['size'] === (int) $file['size']
+			&& (int) $cache_entry['mtime'] === (int) $file['mtime']
+		) {
+			return true;
+		}
+
+		$source_hash = $this->get_file_hash( $file );
+
+		if ( ! hash_equals( $cache_entry['hash'], $source_hash ) ) {
+			return false;
+		}
+
+		$cache_entry['size'] = $file['size'];
+		$cache_entry['mtime'] = $file['mtime'];
+
+		return true;
 	}
 
 	private function get_extensions( $extensions ) {
@@ -1647,6 +2544,45 @@ class Optimize_Images_Command {
 			&& version_compare( $node_version, self::MINIMUM_NODE_VERSION, '>=' );
 	}
 
+	private function get_local_batch_concurrency() {
+		$cores = $this->get_cpu_core_count();
+
+		return max(
+			1,
+			min( self::MAX_LOCAL_BATCH_CONCURRENCY, $cores )
+		);
+	}
+
+	private function get_cpu_core_count() {
+		$windows_cores = getenv( 'NUMBER_OF_PROCESSORS' );
+
+		if ( $windows_cores && ctype_digit( (string) $windows_cores ) ) {
+			return max( 1, (int) $windows_cores );
+		}
+
+		$commands = '\\' === DIRECTORY_SEPARATOR
+			? []
+			: [ 'getconf _NPROCESSORS_ONLN 2>/dev/null', 'nproc 2>/dev/null', 'sysctl -n hw.ncpu 2>/dev/null' ];
+
+		foreach ( $commands as $command ) {
+			$output = [];
+			$status = 0;
+			exec( $command, $output, $status );
+
+			if ( 0 !== $status || empty( $output[0] ) ) {
+				continue;
+			}
+
+			$value = trim( $output[0] );
+
+			if ( ctype_digit( $value ) && (int) $value > 0 ) {
+				return (int) $value;
+			}
+		}
+
+		return self::MAX_LOCAL_BATCH_CONCURRENCY;
+	}
+
 	private function get_node_version() {
 		$output = [];
 		$status = 0;
@@ -1717,7 +2653,7 @@ class Optimize_Images_Command {
 			[
 				'type' => 'positional',
 				'name' => 'arguments',
-				'description' => 'Image directory, or configure/status/sync command.',
+				'description' => 'Image directory, or configure/status/audit/sync command.',
 				'optional' => true,
 				'repeating' => true,
 			],
@@ -1731,6 +2667,12 @@ class Optimize_Images_Command {
 				'type' => 'assoc',
 				'name' => 'extensions',
 				'description' => 'Comma-separated extensions, e.g. jpg,png,svg.',
+				'optional' => true,
+			],
+			[
+				'type' => 'assoc',
+				'name' => 'quality',
+				'description' => 'Local raster quality from 1 to 100. Default: 80.',
 				'optional' => true,
 			],
 			[
@@ -1771,7 +2713,11 @@ class Optimize_Images_Command {
 
     wp optimize-images status
 
+    wp optimize-images audit ./images
+
     wp optimize-images ./images
+
+    wp optimize-images ./images --quality=70
 
     wp optimize-images ./images --max-width=1920
 
