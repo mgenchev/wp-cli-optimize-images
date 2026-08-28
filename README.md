@@ -1,6 +1,6 @@
 WP-CLI Optimize Images
 
-A global WP-CLI command for auditing, resizing and optimizing web image assets.
+A global WP-CLI command for auditing, resizing, converting and optimizing web image assets.
 
 Raster images use TinyPNG when configured, with an automatic local fallback powered by Sharp/libvips. SVG files are optimized locally with SVGO.
 
@@ -16,13 +16,19 @@ Sharp/libvips local raster optimization
 
 SVGO SVG optimization
 
-Automatic proportional resize for raster images
+Optional conversion of all raster files to WebP
 
-Default maximum dimensions of 2880 × 2880 px
+PNG alpha/transparency preserved when converting to WebP
+
+web, default and retina processing presets
+
+Optional per-project .optimize-images.json configuration
+
+Automatic proportional resize for raster images
 
 No upscaling
 
-Configurable local quality, default 80
+Configurable local quality
 
 Recursive directory processing
 
@@ -38,7 +44,7 @@ Automatic cache invalidation when processing settings change
 
 sync mode for removed/changed files
 
-audit report with size, formats, resize candidates and estimated processing time
+audit report with size, formats, resize/conversion candidates and estimated processing time
 
 Batch local processing
 
@@ -85,35 +91,168 @@ No WordPress installation is required to process files.
 
 Quick Start
 
-Optimize all supported files in a directory:
+Optimize all supported files:
 
 wp optimize-images ./images
 
-By default:
+The default preset uses:
 
-raster images larger than 2880 × 2880 px are resized proportionally
+Preset        default
+Max size      2880 × 2880 px
+Local quality 80
 
-smaller images are never enlarged
+Smaller raster images are never enlarged. SVG files are never resized.
 
-local raster quality is 80
+By default output is written to a sibling optimized-images directory and unchanged files are skipped on future runs.
 
-output is written to a sibling optimized-images directory
+Presets
 
-unchanged files are skipped on future runs
+Three built-in presets are available:
+
+Preset
+
+Max dimensions
+
+Local quality
+
+web
+
+1920 × 1920 px
+
+75
+
+default
+
+2880 × 2880 px
+
+80
+
+retina
+
+3840 × 3840 px
+
+85
+
+The default preset is default.
+
+Web
+
+wp optimize-images ./images --preset=web
+
+Suitable for normal web/content imagery where smaller dimensions are preferred.
+
+Default
+
+wp optimize-images ./images --preset=default
+
+The normal balanced processing profile.
+
+Retina
+
+wp optimize-images ./images --preset=retina
+
+Keeps larger raster dimensions and uses a slightly higher local quality.
+
+Specific CLI options override preset values:
+
+wp optimize-images ./images --preset=web --quality=82
+
+wp optimize-images ./images --preset=retina --max-width=3200
+
+WebP Conversion
+
+Convert every raster source file to WebP:
+
+wp optimize-images ./images --format=webp
+
+Examples:
+
+photo.jpg  → photo.webp
+logo.png   → logo.webp
+image.avif → image.webp
+image.webp → image.webp
+icon.svg   → icon.svg
+
+SVG files remain SVG and continue to use SVGO.
+
+PNG transparency is preserved during WebP conversion.
+
+Use --format=original to temporarily disable a project-level WebP conversion setting:
+
+wp optimize-images ./images --format=original
+
+Conversion can be combined with presets:
+
+wp optimize-images ./images --preset=web --format=webp
+
+or with custom settings:
+
+wp optimize-images ./images --format=webp --quality=78 --max-width=2200
+
+If two source files would produce the same output filename, processing stops instead of overwriting one of them. For example:
+
+logo.jpg
+logo.png
+
+cannot both be converted to logo.webp in the same directory.
+
+Project Configuration
+
+A project can define its normal processing settings in:
+
+images/.optimize-images.json
+
+The file belongs in the source directory passed to the command.
 
 Example:
 
-images/
-├── hero.jpg
-├── logo.svg
-└── team/
-    └── member.webp
+{
+    "preset": "web",
+    "format": "webp",
+    "extensions": ["jpg", "jpeg", "png", "webp", "avif", "svg"]
+}
 
-optimized-images/
-├── hero.jpg
-├── logo.svg
-└── team/
-    └── member.webp
+Custom values are also supported:
+
+{
+    "preset": "default",
+    "quality": 82,
+    "max_width": 2600,
+    "max_height": 2600,
+    "format": "webp"
+}
+
+Supported project config properties:
+
+preset
+
+format
+
+quality
+
+max_width
+
+max_height
+
+extensions
+
+The project config is optional.
+
+Configuration Priority
+
+Processing settings are resolved in this order:
+
+built-in default preset
+        ↓
+project config
+        ↓
+CLI preset
+        ↓
+explicit CLI options
+
+An explicit CLI preset replaces the project's preset-controlled resize and quality values for that run. Individual CLI options such as --quality, --max-width, --max-height and --format have final priority.
+
+The project config is separate from the global TinyPNG configuration stored under ~/.wp-cli/.
 
 Commands
 
@@ -139,9 +278,16 @@ files over 1 MB
 
 raster files that exceed the current resize threshold
 
+files that would be converted when --format=webp is active
+
 largest files
 
 a rough expected processing-time range
+
+Examples:
+
+wp optimize-images audit ./images --preset=web
+wp optimize-images audit ./images --format=webp
 
 The time estimate is intentionally approximate. TinyPNG API and network speed can materially affect the real processing time.
 
@@ -160,6 +306,8 @@ reprocess changed files
 skip unchanged files
 
 remove output files whose source no longer exists
+
+remove obsolete file extensions after changing output format
 
 remove empty output directories
 
@@ -183,7 +331,7 @@ wp optimize-images status
 
 Example:
 
-WP-CLI Optimize Images 1.0.0
+WP-CLI Optimize Images 1.1.0
 
   PHP                8.3.6
   cURL               enabled
@@ -193,6 +341,8 @@ WP-CLI Optimize Images 1.0.0
   SVGO               ready (4.x)
   Default resize     2880 × 2880 px
   Default quality    80%
+  Default preset     default
+  Presets            web, default, retina
   Formats            jpg, jpeg, png, webp, avif, svg
 
 Version
@@ -203,7 +353,7 @@ Options
 
 Quality
 
-Local raster quality defaults to 80:
+Override the selected preset's local raster quality:
 
 wp optimize-images ./images --quality=80
 
@@ -211,21 +361,15 @@ Accepted range:
 
 1–100
 
-Example:
-
-wp optimize-images ./images --quality=70
-
 --quality controls the local Sharp path. TinyPNG determines its own compression automatically. SVG optimization is unaffected.
 
 Very low local quality values may produce visible artifacts.
 
 Resize
 
-Default bounding box:
+The selected preset determines the normal resize bounding box.
 
-2880 × 2880 px
-
-Examples:
+Examples using the default preset:
 
 6000 × 4000 → 2880 × 1920
 4000 × 6000 → 1920 × 2880
@@ -283,6 +427,8 @@ does not consume TinyPNG credits
 
 does not execute Sharp or SVGO optimization
 
+reports files that would be resized or converted
+
 Force
 
 Ignore the cache and process all selected files again:
@@ -297,7 +443,7 @@ When TinyPNG is configured:
 
 source
   ↓
-local resize if required
+local resize / WebP conversion if required
   ↓
 TinyPNG
   ↓
@@ -313,7 +459,7 @@ SVG files are always optimized locally with SVGO.
 
 The configuration is intentionally conservative for production assets. It preserves important structures such as viewBox, IDs and accessible description content while removing unnecessary data where possible.
 
-If an optimized local file would be larger than the source and no resize was required, the original file is used as the output instead.
+If an optimized local raster/SVG file would be larger than the source and no resize or format conversion was required, the original file is used as the output instead.
 
 Cache
 
@@ -325,7 +471,7 @@ It stores source hashes and processing settings.
 
 For fast repeat runs, unchanged size + mtime values allow the command to skip a full SHA-256 read. If those values change, SHA-256 is used to verify the file content.
 
-Changing processing settings such as quality or resize dimensions automatically invalidates the relevant cached raster output.
+Changing processing settings such as preset dimensions, quality or output format automatically invalidates the relevant cached raster output.
 
 Cache writes are atomic: the new cache is written to a temporary file and moved into place only after the write succeeds.
 
@@ -350,6 +496,8 @@ The ETA is an approximation based on current-run processing samples, active work
 Completed files are shown in a results table with:
 
 file name
+
+source → output filename when format conversion occurs
 
 resize dimensions when applicable
 

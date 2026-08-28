@@ -22,7 +22,7 @@ class Tiny_Png_Optimization_Exception extends \RuntimeException {
 
 class Optimize_Images_Command {
 
-	private const VERSION = '1.0.0';
+	private const VERSION = '1.1.0';
 	private const MAX_DIMENSION = 20000;
 
 	private const SUPPORTED_EXTENSIONS = [
@@ -35,15 +35,35 @@ class Optimize_Images_Command {
 	];
 
 	private const CONFIG_FILENAME = 'optimize-images.json';
+	private const PROJECT_CONFIG_FILENAME = '.optimize-images.json';
 	private const CACHE_FILENAME = '.optimize-images-cache.json';
 	private const LOCAL_RUNTIME_DIRNAME = 'optimize-images-local';
 	private const LOCAL_OPTIMIZER_FILENAME = 'local-optimizer.cjs';
 	private const SHARP_VERSION = '^0.35.0';
 	private const SVGO_VERSION = '^4.1.0';
 	private const MINIMUM_NODE_VERSION = '20.9.0';
+	private const DEFAULT_PRESET = 'default';
 	private const DEFAULT_MAX_WIDTH = 2880;
 	private const DEFAULT_MAX_HEIGHT = 2880;
 	private const DEFAULT_QUALITY = 80;
+	private const PRESETS = [
+		'web' => [
+			'max_width' => 1920,
+			'max_height' => 1920,
+			'quality' => 75,
+		],
+		'default' => [
+			'max_width' => 2880,
+			'max_height' => 2880,
+			'quality' => 80,
+		],
+		'retina' => [
+			'max_width' => 3840,
+			'max_height' => 3840,
+			'quality' => 85,
+		],
+	];
+	private const SUPPORTED_OUTPUT_FORMATS = [ 'webp' ];
 	private const AUDIT_LARGE_FILE_BYTES = 1048576;
 	private const AUDIT_TOP_FILES = 10;
 	private const TINIFY_FREE_MONTHLY_COMPRESSIONS = 500;
@@ -186,8 +206,11 @@ class Optimize_Images_Command {
 				sprintf( '%d × %d px', self::DEFAULT_MAX_WIDTH, self::DEFAULT_MAX_HEIGHT ),
 			],
 			[ 'Default quality', self::DEFAULT_QUALITY . '%' ],
+			[ 'Default preset', self::DEFAULT_PRESET ],
+			[ 'Presets', 'web, default, retina' ],
 			[ 'Formats', implode( ', ', self::SUPPORTED_EXTENSIONS ) ],
-			[ 'Config', $config_file ],
+			[ 'Global config', $config_file ],
+			[ 'Project config', self::PROJECT_CONFIG_FILENAME . ' (optional)' ],
 		];
 
 		foreach ( $rows as $row ) {
@@ -217,10 +240,13 @@ class Optimize_Images_Command {
 
 	private function audit( $directory, $assoc_args ) {
 		$source_dir = $this->resolve_source_directory( $directory );
+		$assoc_args = $this->resolve_processing_args( $source_dir, $assoc_args );
 		$extensions = $this->get_extensions( $assoc_args['extensions'] ?? null );
 		$resize_settings = $this->get_resize_settings( $assoc_args );
 		$quality = $this->get_quality( $assoc_args, false );
+		$output_format = $this->get_output_format( $assoc_args );
 		$source_files = $this->collect_source_files( $source_dir, $extensions );
+		$this->prepare_output_paths( $source_files, $output_format );
 
 		$total_size = 0;
 		$raster_size = 0;
@@ -228,6 +254,7 @@ class Optimize_Images_Command {
 		$svg_count = 0;
 		$large_count = 0;
 		$oversized_count = 0;
+		$convert_count = 0;
 		$formats = [];
 		$largest = [];
 
@@ -251,6 +278,10 @@ class Optimize_Images_Command {
 			if ( 'svg' === $file['extension'] ) {
 				$svg_count++;
 			} else {
+				if ( ! empty( $file['will_convert'] ) ) {
+					$convert_count++;
+				}
+
 				$raster_count++;
 				$raster_size += $file['size'];
 				$this->hydrate_image_dimensions( $file, [
@@ -283,11 +314,14 @@ class Optimize_Images_Command {
 			$raster_count,
 			$raster_size,
 			$svg_count,
-			$oversized_count
+			$oversized_count,
+			$convert_count
 		);
 
 		\WP_CLI::log( "Source: {$source_dir}" );
 		\WP_CLI::log( 'Extensions: ' . implode( ',', $extensions ) );
+		\WP_CLI::log( 'Preset: ' . $assoc_args['preset'] );
+		\WP_CLI::log( 'Output format: ' . ( $output_format ?: 'original' ) );
 		\WP_CLI::log( sprintf( 'Local quality: %d%%', $quality ) );
 
 		if ( $resize_settings['enabled'] ) {
@@ -313,6 +347,10 @@ class Optimize_Images_Command {
 
 		if ( $resize_settings['enabled'] ) {
 			\WP_CLI::log( sprintf( '  %-20s %d', 'Would resize', $oversized_count ) );
+		}
+
+		if ( $output_format ) {
+			\WP_CLI::log( sprintf( '  %-20s %d', 'Would convert', $convert_count ) );
 		}
 
 		\WP_CLI::log( sprintf( '  %-20s %s', 'Estimated time', $estimate ) );
@@ -364,9 +402,11 @@ class Optimize_Images_Command {
 
 	private function optimize( $directory, $assoc_args, $sync ) {
 		$source_dir = $this->resolve_source_directory( $directory );
+		$assoc_args = $this->resolve_processing_args( $source_dir, $assoc_args );
 		$extensions = $this->get_extensions( $assoc_args['extensions'] ?? null );
 		$resize_settings = $this->get_resize_settings( $assoc_args );
 		$quality = $this->get_quality( $assoc_args );
+		$output_format = $this->get_output_format( $assoc_args );
 		$target_dir = $this->get_target_dir( $source_dir, $assoc_args['output'] ?? null );
 
 		if ( $this->is_same_or_child_path( $target_dir, $source_dir ) ) {
@@ -378,8 +418,9 @@ class Optimize_Images_Command {
 		$cache_file = $target_dir . '/' . self::CACHE_FILENAME;
 		$cache = $this->load_cache( $cache_file );
 		$source_files = $this->collect_source_files( $source_dir, $extensions );
+		$this->prepare_output_paths( $source_files, $output_format );
 		$stale_files = $sync
-			? $this->find_stale_files( $target_dir, $source_files, $extensions )
+			? $this->find_stale_files( $target_dir, $source_files, $extensions, $output_format )
 			: [];
 
 		if ( $dry_run ) {
@@ -392,6 +433,8 @@ class Optimize_Images_Command {
 				$extensions,
 				$resize_settings,
 				$quality,
+				$output_format,
+				$assoc_args['preset'],
 				$force,
 				$sync
 			);
@@ -420,6 +463,8 @@ class Optimize_Images_Command {
 		\WP_CLI::log( "Source: {$source_dir}" );
 		\WP_CLI::log( "Output: {$target_dir}" );
 		\WP_CLI::log( 'Extensions: ' . implode( ',', $extensions ) );
+		\WP_CLI::log( 'Preset: ' . $assoc_args['preset'] );
+		\WP_CLI::log( 'Output format: ' . ( $output_format ?: 'original' ) );
 		\WP_CLI::log(
 			$resize_settings['enabled']
 				? sprintf( 'Resize: max %d × %d px', $resize_settings['max_width'], $resize_settings['max_height'] )
@@ -442,11 +487,12 @@ class Optimize_Images_Command {
 		$skipped = 0;
 
 		foreach ( $source_files as $cache_key => $file ) {
-			$target_file = $target_dir . '/' . $file['relative'];
+			$target_file = $target_dir . '/' . $file['target_relative'];
 			$optimization_signature = $this->get_optimization_signature(
 				$resize_settings,
 				$quality,
-				$file['extension']
+				$file['extension'],
+				$output_format
 			);
 
 			if (
@@ -487,6 +533,8 @@ class Optimize_Images_Command {
 				'file' => $file,
 				'target' => $target_file,
 				'signature' => $optimization_signature,
+				'output_extension' => $file['output_extension'],
+				'will_convert' => $file['will_convert'],
 				'will_resize' => $will_resize,
 				'target_dimensions' => $will_resize
 					? $this->get_target_dimensions( $file, $resize_settings )
@@ -608,6 +656,7 @@ class Optimize_Images_Command {
 
 		$optimized = 0;
 		$resized = 0;
+		$converted = 0;
 		$failed = 0;
 		$original_size = 0;
 		$output_size = 0;
@@ -652,6 +701,10 @@ class Optimize_Images_Command {
 				$resized++;
 			}
 
+			if ( ! empty( $job['will_convert'] ) ) {
+				$converted++;
+			}
+
 			$cache[ $cache_key ] = [
 				'hash' => $source_hash,
 				'signature' => $job['signature'],
@@ -672,8 +725,12 @@ class Optimize_Images_Command {
 				);
 			}
 
+			$display_file = ! empty( $job['will_convert'] )
+				? $file['relative'] . ' → ' . $file['target_relative']
+				: $file['relative'];
+
 			$file_results[] = [
-				'File' => $this->truncate_table_value( $file['relative'], 50 ),
+				'File' => $this->truncate_table_value( $display_file, 50 ),
 				'Resize' => $resize_label,
 				'Before' => $this->format_bytes( $before ),
 				'After' => $this->format_bytes( $after ),
@@ -693,6 +750,7 @@ class Optimize_Images_Command {
 			count( $source_files ),
 			$optimized,
 			$resized,
+			$converted,
 			$skipped,
 			$failed,
 			$removed,
@@ -708,7 +766,7 @@ class Optimize_Images_Command {
 		$resize_jobs = [];
 
 		foreach ( $jobs as $cache_key => $job ) {
-			if ( empty( $job['will_resize'] ) ) {
+			if ( empty( $job['will_resize'] ) && empty( $job['will_convert'] ) ) {
 				$prepared[ $cache_key ] = [
 					'source' => $job['file']['source'],
 					'target' => $job['target'],
@@ -725,15 +783,15 @@ class Optimize_Images_Command {
 				. '/'
 				. hash( 'sha256', $cache_key )
 				. '.'
-				. $job['file']['extension'];
+				. $job['output_extension'];
 
 			$resize_jobs[ $cache_key ] = [
 				'mode' => 'resize',
 				'input' => $job['file']['source'],
 				'output' => $temp_file,
-				'extension' => $job['file']['extension'],
-				'max_width' => $resize_settings['max_width'],
-				'max_height' => $resize_settings['max_height'],
+				'extension' => $job['output_extension'],
+				'max_width' => ! empty( $job['will_resize'] ) ? $resize_settings['max_width'] : 0,
+				'max_height' => ! empty( $job['will_resize'] ) ? $resize_settings['max_height'] : 0,
 			];
 		}
 
@@ -1080,7 +1138,7 @@ class Optimize_Images_Command {
 				'mode' => $is_svg ? 'svg-optimize' : 'optimize',
 				'input' => $job['file']['source'],
 				'output' => $temp_target,
-				'extension' => $job['file']['extension'],
+				'extension' => $job['output_extension'],
 				'quality' => $quality,
 				'max_width' => ! $is_svg && ! empty( $job['will_resize'] )
 					? $resize_settings['max_width']
@@ -1124,7 +1182,11 @@ class Optimize_Images_Command {
 				continue;
 			}
 
-			if ( $optimized_size >= $source_size && empty( $job['will_resize'] ) ) {
+			if (
+				$optimized_size >= $source_size
+				&& empty( $job['will_resize'] )
+				&& empty( $job['will_convert'] )
+			) {
 				if ( ! copy( $job['file']['source'], $batch_job['output'] ) ) {
 					@unlink( $batch_job['output'] );
 					$this->unregister_temp_artifact( $batch_job['output'] );
@@ -1650,12 +1712,16 @@ class Optimize_Images_Command {
 		$extensions,
 		$resize_settings,
 		$quality,
+		$output_format,
+		$preset,
 		$force,
 		$sync
 	) {
 		\WP_CLI::log( "Source: {$source_dir}" );
 		\WP_CLI::log( "Output: {$target_dir}" );
 		\WP_CLI::log( 'Extensions: ' . implode( ',', $extensions ) );
+		\WP_CLI::log( 'Preset: ' . $preset );
+		\WP_CLI::log( 'Output format: ' . ( $output_format ?: 'original' ) );
 		\WP_CLI::log(
 			$resize_settings['enabled']
 				? sprintf( 'Resize: max %d × %d px', $resize_settings['max_width'], $resize_settings['max_height'] )
@@ -1667,16 +1733,18 @@ class Optimize_Images_Command {
 
 		$would_optimize = 0;
 		$would_resize = 0;
+		$would_convert = 0;
 		$unchanged = 0;
 		$total_size = 0;
 
 		foreach ( $source_files as $cache_key => $file ) {
-			$target_file = $target_dir . '/' . $file['relative'];
+			$target_file = $target_dir . '/' . $file['target_relative'];
 			$total_size += $file['size'];
 			$optimization_signature = $this->get_optimization_signature(
 				$resize_settings,
 				$quality,
-				$file['extension']
+				$file['extension'],
+				$output_format
 			);
 
 			if (
@@ -1696,6 +1764,10 @@ class Optimize_Images_Command {
 			$this->hydrate_image_dimensions( $file, $resize_settings );
 			$resize_label = '';
 
+			if ( ! empty( $file['will_convert'] ) ) {
+				$would_convert++;
+			}
+
 			if ( $this->should_resize( $file, $resize_settings ) ) {
 				$target_dimensions = $this->get_target_dimensions( $file, $resize_settings );
 				$would_resize++;
@@ -1711,7 +1783,11 @@ class Optimize_Images_Command {
 				}
 			}
 
-			\WP_CLI::log( "+ {$file['relative']}{$resize_label} (would optimize)" );
+			$display_file = ! empty( $file['will_convert'] )
+				? $file['relative'] . ' → ' . $file['target_relative']
+				: $file['relative'];
+
+			\WP_CLI::log( "+ {$display_file}{$resize_label} (would optimize)" );
 			$would_optimize++;
 		}
 
@@ -1727,6 +1803,11 @@ class Optimize_Images_Command {
 		\WP_CLI::log( sprintf( '  %-18s %d', 'Found:', count( $source_files ) ) );
 		\WP_CLI::log( sprintf( '  %-18s %d', 'Would optimize:', $would_optimize ) );
 		\WP_CLI::log( sprintf( '  %-18s %d', 'Would resize:', $would_resize ) );
+
+		if ( $output_format ) {
+			\WP_CLI::log( sprintf( '  %-18s %d', 'Would convert:', $would_convert ) );
+		}
+
 		\WP_CLI::log( sprintf( '  %-18s %d', 'Unchanged:', $unchanged ) );
 
 		if ( $sync ) {
@@ -2233,6 +2314,7 @@ class Optimize_Images_Command {
 		$found,
 		$optimized,
 		$resized,
+		$converted,
 		$skipped,
 		$failed,
 		$removed,
@@ -2255,6 +2337,11 @@ class Optimize_Images_Command {
 		\WP_CLI::log( sprintf( '  %d total', $found ) );
 		\WP_CLI::log( sprintf( '  %d optimized', $optimized ) );
 		\WP_CLI::log( sprintf( '  %d resized', $resized ) );
+
+		if ( $converted > 0 ) {
+			\WP_CLI::log( sprintf( '  %d converted', $converted ) );
+		}
+
 		\WP_CLI::log( sprintf( '  %d skipped', $skipped ) );
 
 		if ( $sync ) {
@@ -2351,6 +2438,9 @@ class Optimize_Images_Command {
 				'hash' => null,
 				'width' => null,
 				'height' => null,
+				'target_relative' => $relative,
+				'output_extension' => $extension,
+				'will_convert' => false,
 			];
 		}
 
@@ -2358,12 +2448,25 @@ class Optimize_Images_Command {
 		return $files;
 	}
 
-	private function find_stale_files( $target_dir, $source_files, $extensions ) {
+	private function find_stale_files( $target_dir, $source_files, $extensions, $output_format = null ) {
 		if ( ! is_dir( $target_dir ) ) {
 			return [];
 		}
 
 		$stale = [];
+		$expected_targets = [];
+
+		foreach ( $source_files as $source_file ) {
+			$expected_targets[ $source_file['target_relative'] ] = true;
+		}
+
+		$scan_extensions = $extensions;
+
+		if ( $output_format ) {
+			$scan_extensions[] = $output_format;
+			$scan_extensions = array_values( array_unique( $scan_extensions ) );
+		}
+
 		$iterator = new \RecursiveIteratorIterator(
 			new \RecursiveDirectoryIterator( $target_dir, \FilesystemIterator::SKIP_DOTS )
 		);
@@ -2375,7 +2478,7 @@ class Optimize_Images_Command {
 
 			$extension = strtolower( $file->getExtension() );
 
-			if ( ! in_array( $extension, $extensions, true ) ) {
+			if ( ! in_array( $extension, $scan_extensions, true ) ) {
 				continue;
 			}
 
@@ -2384,7 +2487,7 @@ class Optimize_Images_Command {
 				substr( $target_file, strlen( $target_dir ) + 1 )
 			);
 
-			if ( ! isset( $source_files[ $relative ] ) ) {
+			if ( ! isset( $expected_targets[ $relative ] ) ) {
 				$stale[ $relative ] = $target_file;
 			}
 		}
@@ -2471,7 +2574,8 @@ class Optimize_Images_Command {
 		$raster_count,
 		$raster_size,
 		$svg_count,
-		$oversized_count
+		$oversized_count,
+		$convert_count = 0
 	) {
 		if ( 0 === $raster_count && 0 === $svg_count ) {
 			return '~0:00';
@@ -2488,6 +2592,7 @@ class Optimize_Images_Command {
 			$seconds = ( $waves * 4.0 )
 				+ ( $raster_mb * 0.9 )
 				+ ( $oversized_count * 0.75 )
+				+ ( $convert_count * 0.6 )
 				+ ( $svg_count * 0.12 );
 		} else {
 			$workers = max( 1, $this->get_local_batch_concurrency() );
@@ -2509,15 +2614,183 @@ class Optimize_Images_Command {
 		);
 	}
 
+
+	private function resolve_processing_args( $source_dir, $assoc_args ) {
+		$project_config = $this->get_project_config( $source_dir );
+		$project_preset = $project_config['preset'] ?? self::DEFAULT_PRESET;
+		$this->validate_preset( $project_preset );
+		$preset = self::PRESETS[ $project_preset ];
+
+		$resolved = [
+			'preset' => $project_preset,
+			'max-width' => $preset['max_width'],
+			'max-height' => $preset['max_height'],
+			'quality' => $preset['quality'],
+		];
+
+		$config_map = [
+			'quality' => 'quality',
+			'max_width' => 'max-width',
+			'max_height' => 'max-height',
+			'format' => 'format',
+			'extensions' => 'extensions',
+		];
+
+		foreach ( $config_map as $config_key => $arg_key ) {
+			if ( array_key_exists( $config_key, $project_config ) ) {
+				$resolved[ $arg_key ] = $project_config[ $config_key ];
+			}
+		}
+
+		if ( isset( $assoc_args['preset'] ) ) {
+			$cli_preset = strtolower( trim( (string) $assoc_args['preset'] ) );
+			$this->validate_preset( $cli_preset );
+			$resolved['preset'] = $cli_preset;
+			$resolved['max-width'] = self::PRESETS[ $cli_preset ]['max_width'];
+			$resolved['max-height'] = self::PRESETS[ $cli_preset ]['max_height'];
+			$resolved['quality'] = self::PRESETS[ $cli_preset ]['quality'];
+		}
+
+		foreach ( $assoc_args as $key => $value ) {
+			if ( 'preset' === $key ) {
+				continue;
+			}
+
+			$resolved[ $key ] = $value;
+		}
+
+		return $resolved;
+	}
+
+	private function get_project_config( $source_dir ) {
+		$config_file = $source_dir . '/' . self::PROJECT_CONFIG_FILENAME;
+
+		if ( ! file_exists( $config_file ) ) {
+			return [];
+		}
+
+		if ( ! is_readable( $config_file ) ) {
+			\WP_CLI::error( 'Project config is not readable: ' . $config_file );
+		}
+
+		$contents = file_get_contents( $config_file );
+		$config = false !== $contents ? json_decode( $contents, true ) : null;
+
+		if ( ! is_array( $config ) ) {
+			\WP_CLI::error( 'Project config contains invalid JSON: ' . $config_file );
+		}
+
+		$allowed = [
+			'preset',
+			'format',
+			'quality',
+			'max_width',
+			'max_height',
+			'extensions',
+		];
+
+		if ( isset( $config['preset'] ) && ! is_string( $config['preset'] ) ) {
+			\WP_CLI::error( 'Project config preset must be a string.' );
+		}
+
+		if ( isset( $config['format'] ) && ! is_string( $config['format'] ) ) {
+			\WP_CLI::error( 'Project config format must be a string.' );
+		}
+
+		if ( isset( $config['extensions'] ) && ! is_array( $config['extensions'] ) && ! is_string( $config['extensions'] ) ) {
+			\WP_CLI::error( 'Project config extensions must be an array or comma-separated string.' );
+		}
+
+		$unknown = array_diff( array_keys( $config ), $allowed );
+
+		if ( ! empty( $unknown ) ) {
+			\WP_CLI::error(
+				'Unknown project config option(s): ' . implode( ', ', $unknown )
+			);
+		}
+
+		return $config;
+	}
+
+	private function validate_preset( $preset ) {
+		$preset = strtolower( trim( (string) $preset ) );
+
+		if ( ! isset( self::PRESETS[ $preset ] ) ) {
+			\WP_CLI::error(
+				'Unsupported preset: '
+				. $preset
+				. '. Available: '
+				. implode( ', ', array_keys( self::PRESETS ) )
+			);
+		}
+	}
+
+	private function get_output_format( $assoc_args ) {
+		if ( empty( $assoc_args['format'] ) ) {
+			return null;
+		}
+
+		$format = strtolower( ltrim( trim( (string) $assoc_args['format'] ), '.' ) );
+
+		if ( 'original' === $format ) {
+			return null;
+		}
+
+		if ( ! in_array( $format, self::SUPPORTED_OUTPUT_FORMATS, true ) ) {
+			\WP_CLI::error(
+				'Unsupported output format: '
+				. $format
+				. '. Supported: '
+				. implode( ', ', self::SUPPORTED_OUTPUT_FORMATS )
+			);
+		}
+
+		return $format;
+	}
+
+	private function prepare_output_paths( &$source_files, $output_format ) {
+		$targets = [];
+
+		foreach ( $source_files as $cache_key => &$file ) {
+			$output_extension = 'svg' === $file['extension'] || ! $output_format
+				? $file['extension']
+				: $output_format;
+			$target_relative = $file['relative'];
+
+			if ( $output_extension !== $file['extension'] ) {
+				$target_relative = preg_replace(
+					'/\.[^.\/]+$/',
+					'.' . $output_extension,
+					$file['relative']
+				);
+			}
+
+			$target_key = '\\' === DIRECTORY_SEPARATOR
+				? strtolower( $target_relative )
+				: $target_relative;
+
+			if ( isset( $targets[ $target_key ] ) ) {
+				\WP_CLI::error(
+					'Output filename collision: '
+					. $targets[ $target_key ]
+					. ' and '
+					. $file['relative']
+					. ' would both become '
+					. $target_relative
+				);
+			}
+
+			$targets[ $target_key ] = $file['relative'];
+			$file['target_relative'] = $target_relative;
+			$file['output_extension'] = $output_extension;
+			$file['will_convert'] = 'svg' !== $file['extension']
+				&& $output_extension !== $file['extension'];
+		}
+		unset( $file );
+	}
+
 	private function get_resize_settings( $assoc_args ) {
 		$no_resize = isset( $assoc_args['no-resize'] );
-
-		if (
-			$no_resize
-			&& ( isset( $assoc_args['max-width'] ) || isset( $assoc_args['max-height'] ) )
-		) {
-			\WP_CLI::error( '--no-resize cannot be combined with --max-width or --max-height.' );
-		}
 
 		if ( $no_resize ) {
 			return [
@@ -2631,25 +2904,29 @@ class Optimize_Images_Command {
 		];
 	}
 
-	private function get_optimization_signature( $resize_settings, $quality, $extension ) {
+	private function get_optimization_signature( $resize_settings, $quality, $extension, $output_format = null ) {
 		if ( 'svg' === $extension ) {
 			return sprintf( 'v%d|svg', self::PROCESSING_VERSION );
 		}
 
+		$format_suffix = $output_format ? '|format:' . $output_format : '';
+
 		if ( ! $resize_settings['enabled'] ) {
 			return sprintf(
-				'v%d|resize:none|quality:%d',
+				'v%d|resize:none|quality:%d%s',
 				self::PROCESSING_VERSION,
-				$quality
+				$quality,
+				$format_suffix
 			);
 		}
 
 		return sprintf(
-			'v%d|resize:%dx%d|quality:%d',
+			'v%d|resize:%dx%d|quality:%d%s',
 			self::PROCESSING_VERSION,
 			$resize_settings['max_width'],
 			$resize_settings['max_height'],
-			$quality
+			$quality,
+			$format_suffix
 		);
 	}
 
@@ -2725,12 +3002,16 @@ class Optimize_Images_Command {
 			return self::SUPPORTED_EXTENSIONS;
 		}
 
+		$extension_values = is_array( $extensions )
+			? $extensions
+			: explode( ',', strtolower( (string) $extensions ) );
+
 		$extensions = array_values(
 			array_unique(
 				array_filter(
 					array_map(
-						static fn( $extension ) => ltrim( trim( $extension ), '.' ),
-						explode( ',', strtolower( $extensions ) )
+						static fn( $extension ) => ltrim( trim( strtolower( (string) $extension ) ), '.' ),
+						$extension_values
 					)
 				)
 			)
@@ -3043,20 +3324,32 @@ class Optimize_Images_Command {
 			],
 			[
 				'type' => 'assoc',
+				'name' => 'preset',
+				'description' => 'Processing preset: web, default or retina.',
+				'optional' => true,
+			],
+			[
+				'type' => 'assoc',
+				'name' => 'format',
+				'description' => 'Raster output format: webp or original.',
+				'optional' => true,
+			],
+			[
+				'type' => 'assoc',
 				'name' => 'quality',
-				'description' => 'Local raster quality from 1 to 100. Default: 80.',
+				'description' => 'Local raster quality from 1 to 100. Overrides the selected preset.',
 				'optional' => true,
 			],
 			[
 				'type' => 'assoc',
 				'name' => 'max-width',
-				'description' => 'Maximum image width in pixels. Default: 2880.',
+				'description' => 'Maximum image width in pixels. Overrides the selected preset.',
 				'optional' => true,
 			],
 			[
 				'type' => 'assoc',
 				'name' => 'max-height',
-				'description' => 'Maximum image height in pixels. Default: 2880.',
+				'description' => 'Maximum image height in pixels. Overrides the selected preset.',
 				'optional' => true,
 			],
 			[
@@ -3090,6 +3383,14 @@ class Optimize_Images_Command {
     wp optimize-images audit ./images
 
     wp optimize-images ./images
+
+    wp optimize-images ./images --preset=web
+
+    wp optimize-images ./images --preset=retina
+
+    wp optimize-images ./images --format=webp
+
+    wp optimize-images ./images --format=original
 
     wp optimize-images ./images --quality=70
 
