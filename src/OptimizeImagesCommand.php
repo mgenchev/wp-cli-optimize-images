@@ -6,6 +6,31 @@ if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {
 	return;
 }
 
+final class Terminal {
+
+	public static function is_interactive() {
+		if ( ! defined( 'STDOUT' ) ) {
+			return false;
+		}
+
+		if ( function_exists( 'stream_isatty' ) ) {
+			return @stream_isatty( STDOUT );
+		}
+
+		return function_exists( 'posix_isatty' ) ? @posix_isatty( STDOUT ) : false;
+	}
+
+	public static function clear_screen( $interactive = null ) {
+		if ( null === $interactive ) {
+			$interactive = self::is_interactive();
+		}
+
+		if ( $interactive ) {
+			fwrite( STDOUT, "\033[2J\033[H" );
+		}
+	}
+}
+
 class Tiny_Png_Optimization_Exception extends \RuntimeException {
 
 	private $disable_for_run;
@@ -65,7 +90,6 @@ class Optimize_Images_Command {
 	];
 	private const SUPPORTED_OUTPUT_FORMATS = [ 'webp' ];
 	private const AUDIT_LARGE_FILE_BYTES = 1048576;
-	private const AUDIT_TOP_FILES = 10;
 	private const TINIFY_FREE_MONTHLY_COMPRESSIONS = 500;
 	private const PROCESSING_VERSION = 3;
 	private const TINYPNG_CONCURRENCY = 3;
@@ -144,6 +168,8 @@ class Optimize_Images_Command {
 	}
 
 	private function configure() {
+		Terminal::clear_screen();
+
 		\WP_CLI::log( 'TinyPNG API configuration' );
 		\WP_CLI::log( '' );
 		fwrite( STDOUT, 'Enter TinyPNG API key: ' );
@@ -307,7 +333,13 @@ class Optimize_Images_Command {
 			static fn( $a, $b ) => $b['size'] <=> $a['size']
 		);
 
-		$largest = array_slice( $largest, 0, self::AUDIT_TOP_FILES );
+		$largest = array_filter(
+			$largest,
+			static function ( $file ) {
+				return $file['size'] >= 1024 * 1024;
+			}
+		);
+
 		ksort( $formats );
 
 		$estimate = $this->estimate_audit_processing_time(
@@ -338,7 +370,9 @@ class Optimize_Images_Command {
 
 		\WP_CLI::log( '' );
 		\WP_CLI::log( 'Audit' );
-		\WP_CLI::log( '' );
+		\WP_CLI::log(
+			str_repeat( '─', 40 )
+		);
 		\WP_CLI::log( sprintf( '  %-20s %d', 'Files', count( $source_files ) ) );
 		\WP_CLI::log( sprintf( '  %-20s %d', 'Raster', $raster_count ) );
 		\WP_CLI::log( sprintf( '  %-20s %d', 'SVG', $svg_count ) );
@@ -353,13 +387,22 @@ class Optimize_Images_Command {
 			\WP_CLI::log( sprintf( '  %-20s %d', 'Would convert', $convert_count ) );
 		}
 
-		\WP_CLI::log( sprintf( '  %-20s %s', 'Estimated time', $estimate ) );
-		\WP_CLI::log( '  Estimate is approximate and depends on API/network speed.' );
+		\WP_CLI::log( '' );
+		\WP_CLI::log( sprintf(
+			'  %s  %s  (%s)',
+			'Estimated time',
+			$estimate,
+			'Estimate is approximate and depends on API/network speed.'
+		) );
 
 		if ( ! empty( $formats ) ) {
 			\WP_CLI::log( '' );
+			\WP_CLI::log( '' );
 			\WP_CLI::log( 'Formats' );
-
+			\WP_CLI::log(
+				str_repeat( '─', 40 )
+			);
+			
 			foreach ( $formats as $extension => $data ) {
 				\WP_CLI::log(
 					sprintf(
@@ -374,7 +417,11 @@ class Optimize_Images_Command {
 
 		if ( ! empty( $largest ) ) {
 			\WP_CLI::log( '' );
-			\WP_CLI::log( sprintf( 'Largest files (top %d)', count( $largest ) ) );
+			\WP_CLI::log( '' );
+			\WP_CLI::log( 'Files over 1 MB' );
+			\WP_CLI::log(
+				str_repeat( '─', 40 )
+			);
 
 			foreach ( $largest as $file ) {
 				$details = 'svg' === $file['extension']
@@ -396,6 +443,7 @@ class Optimize_Images_Command {
 			}
 		}
 
+		\WP_CLI::log( '' );
 		\WP_CLI::log( '' );
 		\WP_CLI::success( 'Audit complete. No files were changed.' );
 	}
@@ -2162,7 +2210,7 @@ class Optimize_Images_Command {
 				$percent
 			),
 			sprintf(
-				'%s elapsed · ETA %s %s',
+				'elapsed %s ·|· ETA %s %s',
 				$this->format_progress_duration( (int) floor( $elapsed ) ),
 				$eta_value,
 				$spinner
@@ -2578,7 +2626,7 @@ class Optimize_Images_Command {
 		$convert_count = 0
 	) {
 		if ( 0 === $raster_count && 0 === $svg_count ) {
-			return '~0:00';
+			return '~ 0:00';
 		}
 
 		$raster_mb = $raster_size / 1024 / 1024;
@@ -2606,11 +2654,11 @@ class Optimize_Images_Command {
 		$seconds = max( 2.0, $seconds );
 		$minimum = max( 1, (int) floor( $seconds * 0.7 ) );
 		$maximum = max( $minimum + 1, (int) ceil( $seconds * 1.4 ) );
+		$avarage = ( $minimum + $maximum ) / 2;
 
 		return sprintf(
-			'~%s–%s',
-			$this->format_progress_duration( $minimum ),
-			$this->format_progress_duration( $maximum )
+			'~ %s',
+			$this->format_progress_duration( $avarage )
 		);
 	}
 
