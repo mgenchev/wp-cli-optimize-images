@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+[Unreleased]
+
+Fixed
+
+Added early environment compatibility checks before image processing starts.
+
+Node.js compatibility is now checked before cache filtering, so incompatible environments fail clearly even when all optimized outputs already exist and the run would otherwise report `Everything is up to date`.
+
+Node.js versions older than 20.9.0 now fail with a clear message before the progress display instead of reaching the local Sharp/SVGO worker.
+
+Installed local optimizer dependencies are verified against the active Node.js runtime before use.
+
+`wp optimize-images status` now reports incompatible Node.js and disabled `proc_open` environments explicitly.
+
 [1.1.0]
 
 Added

@@ -22,11 +22,13 @@ Original files are never modified. Processed files are written to a separate out
 - PHP 8.1+
 - WP-CLI
 - Node.js 20.9+
-- npm
+- npm when the local Sharp/SVGO runtime must be installed
 - PHP cURL extension when using TinyPNG
 - TinyPNG API key is optional
 
-Node.js is used for Sharp/libvips and SVGO. The local runtime is installed automatically when first required.
+Node.js is used for Sharp/libvips and SVGO. Sharp `0.35.x` requires Node.js `20.9.0+`. The `optimize` and `sync` flows validate the active Node.js runtime before cache filtering, so an incompatible environment is reported even when every output image is already up to date. The local runtime is installed automatically when first required.
+
+If the local runtime is already installed, the command also verifies that Sharp and SVGO can actually be loaded by the current Node.js version before processing starts. This catches stale/incompatible runtimes after changing Node.js versions.
 
 ## Installation
 
@@ -169,6 +171,7 @@ WP-CLI Optimize Images 1.1.0
 
 PHP                8.3.6
 cURL               enabled
+proc_open           enabled
 Node.js            22.x.x
 TinyPNG            configured
 Sharp              ready (0.35.x)
@@ -178,6 +181,13 @@ Default quality    80%
 Default preset     default
 Presets            web, default, retina
 Formats            jpg, jpeg, png, webp, avif, svg
+```
+
+When Node.js is incompatible, `status` reports it explicitly, for example:
+
+```text
+Node.js            14.21.3 (incompatible; requires 20.9.0+)
+Warning: Node.js 20.9.0+ is required for image optimization (Sharp ^0.35.0). Current version: 14.21.3. Upgrade Node.js and run the command again.
 ```
 
 ### Version

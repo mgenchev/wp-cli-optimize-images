@@ -205,7 +205,15 @@ class Optimize_Images_Command {
 		$environment_key = getenv( 'TINIFY_API_KEY' );
 		$stored_key = $this->get_stored_api_key();
 		$node_version = $this->get_node_version();
-		$local_ready = $this->is_local_optimizer_ready();
+		$node_compatibility = $this->get_node_compatibility( $node_version );
+		$runtime_files_present = $this->has_local_optimizer_runtime_files();
+		$runtime_check = $runtime_files_present
+			? $this->check_local_optimizer_runtime()
+			: [ 'usable' => false, 'message' => 'not installed' ];
+		$local_ready = $node_compatibility['compatible']
+			&& function_exists( 'proc_open' )
+			&& $runtime_files_present
+			&& ! empty( $runtime_check['usable'] );
 		$sharp_version = $this->get_local_dependency_version( 'sharp' );
 		$svgo_version = $this->get_local_dependency_version( 'svgo' );
 
@@ -220,13 +228,20 @@ class Optimize_Images_Command {
 		\WP_CLI::log( 'WP-CLI Optimize Images ' . self::VERSION );
 		\WP_CLI::log( '' );
 
+		$node_status = $node_version ?: 'not found';
+
+		if ( ! $node_compatibility['compatible'] ) {
+			$node_status .= ' (incompatible; requires ' . self::MINIMUM_NODE_VERSION . '+)';
+		}
+
 		$rows = [
 			[ 'PHP', PHP_VERSION ],
 			[ 'cURL', function_exists( 'curl_init' ) ? 'enabled' : 'disabled' ],
-			[ 'Node.js', $node_version ?: 'not found' ],
+			[ 'proc_open', function_exists( 'proc_open' ) ? 'enabled' : 'disabled' ],
+			[ 'Node.js', $node_status ],
 			[ 'TinyPNG', $key_status ],
-			[ 'Sharp', $sharp_version ? 'ready (' . $sharp_version . ')' : 'not installed' ],
-			[ 'SVGO', $svgo_version ? 'ready (' . $svgo_version . ')' : 'not installed' ],
+			[ 'Sharp', $sharp_version ? ( $local_ready ? 'ready (' . $sharp_version . ')' : 'installed (' . $sharp_version . ')' ) : 'not installed' ],
+			[ 'SVGO', $svgo_version ? ( $local_ready ? 'ready (' . $svgo_version . ')' : 'installed (' . $svgo_version . ')' ) : 'not installed' ],
 			[
 				'Default resize',
 				sprintf( '%d × %d px', self::DEFAULT_MAX_WIDTH, self::DEFAULT_MAX_HEIGHT ),
@@ -251,17 +266,27 @@ class Optimize_Images_Command {
 
 		\WP_CLI::log( '' );
 
-		if (
-			$environment_key
-			|| $stored_key
-			|| $local_ready
-			|| ( $node_version && $this->command_exists( 'npm' ) )
-		) {
+		if ( ! $node_compatibility['compatible'] ) {
+			\WP_CLI::warning( $node_compatibility['message'] );
+			return;
+		}
+
+		if ( ! function_exists( 'proc_open' ) ) {
+			\WP_CLI::warning( 'PHP proc_open() is required for the local image optimizer.' );
+			return;
+		}
+
+		if ( $runtime_files_present && empty( $runtime_check['usable'] ) ) {
+			\WP_CLI::warning( 'Local optimizer runtime check failed: ' . $runtime_check['message'] );
+			return;
+		}
+
+		if ( $environment_key || $stored_key || $local_ready || $this->command_exists( 'npm' ) ) {
 			\WP_CLI::success( 'Ready.' );
 			return;
 		}
 
-		\WP_CLI::warning( 'Node.js and npm are required when TinyPNG is not available.' );
+		\WP_CLI::warning( 'npm is required to install the local image optimizer.' );
 	}
 
 	private function audit( $directory, $assoc_args ) {
@@ -457,6 +482,8 @@ class Optimize_Images_Command {
 		$output_format = $this->get_output_format( $assoc_args );
 		$target_dir = $this->get_target_dir( $source_dir, $assoc_args['output'] ?? null );
 
+		$this->assert_processing_environment( false );
+
 		if ( $this->is_same_or_child_path( $target_dir, $source_dir ) ) {
 			\WP_CLI::error( 'The output directory cannot be inside the input directory.' );
 		}
@@ -639,19 +666,36 @@ class Optimize_Images_Command {
 		}
 
 		if ( ! empty( $processable ) ) {
+			$svg_jobs = array_filter(
+				$processable,
+				static fn( $job ) => 'svg' === $job['file']['extension']
+			);
+
+			$raster_jobs = array_filter(
+				$processable,
+				static fn( $job ) => 'svg' !== $job['file']['extension']
+			);
+
+			$requires_local_optimizer = ! empty( $svg_jobs )
+				|| ( ! $api_key && ! empty( $raster_jobs ) )
+				|| ! empty(
+					array_filter(
+						$raster_jobs,
+						static fn( $job ) => ! empty( $job['will_resize'] ) || ! empty( $job['will_convert'] )
+					)
+				);
+
+			$this->assert_processing_environment( $requires_local_optimizer );
+
+			if ( $requires_local_optimizer ) {
+				$this->ensure_local_optimizer();
+			} elseif ( $this->has_local_optimizer_runtime_files() ) {
+				$this->assert_local_optimizer_runtime_compatible();
+			}
+
 			$this->start_progress( $processable, (bool) $api_key );
 
 			try {
-				$svg_jobs = array_filter(
-					$processable,
-					static fn( $job ) => 'svg' === $job['file']['extension']
-				);
-
-				$raster_jobs = array_filter(
-					$processable,
-					static fn( $job ) => 'svg' !== $job['file']['extension']
-				);
-
 				if ( ! empty( $svg_jobs ) ) {
 					$results = array_replace(
 						$results,
@@ -1617,14 +1661,196 @@ class Optimize_Images_Command {
 		$this->unregister_temp_artifact( $directory );
 	}
 
+	private function get_node_compatibility( $node_version ) {
+		if ( ! $node_version ) {
+			return [
+				'compatible' => false,
+				'message' => sprintf(
+					'Node.js %s+ is required for image optimization, but Node.js was not found in PATH.',
+					self::MINIMUM_NODE_VERSION
+				),
+			];
+		}
+
+		if ( version_compare( $node_version, self::MINIMUM_NODE_VERSION, '<' ) ) {
+			return [
+				'compatible' => false,
+				'message' => sprintf(
+					'Node.js %s+ is required for image optimization (Sharp %s). Current version: %s. Upgrade Node.js and run the command again.',
+					self::MINIMUM_NODE_VERSION,
+					self::SHARP_VERSION,
+					$node_version
+				),
+			];
+		}
+
+		return [
+			'compatible' => true,
+			'message' => '',
+		];
+	}
+
+	private function assert_processing_environment( $requires_local_optimizer = false ) {
+		$node_compatibility = $this->get_node_compatibility( $this->get_node_version() );
+
+		if ( ! $node_compatibility['compatible'] ) {
+			\WP_CLI::error( $node_compatibility['message'] );
+		}
+
+		if ( $requires_local_optimizer && ! function_exists( 'proc_open' ) ) {
+			\WP_CLI::error( 'PHP proc_open() is required to run the local image optimizer.' );
+		}
+	}
+
+	private function has_local_optimizer_runtime_files() {
+		$runtime_dir = $this->get_local_runtime_dir();
+
+		return file_exists( $this->get_local_optimizer_script() )
+			&& file_exists( $runtime_dir . '/node_modules/sharp/package.json' )
+			&& file_exists( $runtime_dir . '/node_modules/svgo/package.json' );
+	}
+
+	private function check_local_optimizer_runtime() {
+		if ( ! $this->has_local_optimizer_runtime_files() ) {
+			return [
+				'usable' => false,
+				'message' => 'Local optimizer dependencies are not installed.',
+			];
+		}
+
+		$result = $this->run_environment_process(
+			[
+				'node',
+				'-e',
+				'require("sharp"); require("svgo"); process.stdout.write("WP_OPTIMIZE_READY\\n");',
+			],
+			$this->get_local_runtime_dir(),
+			5
+		);
+
+		if ( ! empty( $result['success'] ) && false !== strpos( $result['stdout'], 'WP_OPTIMIZE_READY' ) ) {
+			return [
+				'usable' => true,
+				'message' => '',
+			];
+		}
+
+		$message = trim( (string) ( $result['stderr'] ?? '' ) );
+
+		if ( '' === $message && ! empty( $result['message'] ) ) {
+			$message = $result['message'];
+		}
+
+		return [
+			'usable' => false,
+			'message' => '' !== $message
+				? $message
+				: 'The local optimizer could not load Sharp/SVGO with the current Node.js runtime.',
+		];
+	}
+
+	private function run_environment_process( array $command, $cwd = null, $timeout = 5 ) {
+		if ( ! function_exists( 'proc_open' ) ) {
+			return [
+				'success' => false,
+				'stdout' => '',
+				'stderr' => '',
+				'message' => 'PHP proc_open() is unavailable.',
+			];
+		}
+
+		$descriptors = [
+			0 => [ 'pipe', 'r' ],
+			1 => [ 'pipe', 'w' ],
+			2 => [ 'pipe', 'w' ],
+		];
+		$process = proc_open(
+			$command,
+			$descriptors,
+			$pipes,
+			$cwd,
+			null,
+			[ 'bypass_shell' => true ]
+		);
+
+		if ( ! is_resource( $process ) ) {
+			return [
+				'success' => false,
+				'stdout' => '',
+				'stderr' => '',
+				'message' => 'Could not start environment check process.',
+			];
+		}
+
+		fclose( $pipes[0] );
+		stream_set_blocking( $pipes[1], false );
+		stream_set_blocking( $pipes[2], false );
+
+		$stdout = '';
+		$stderr = '';
+		$started_at = microtime( true );
+		$exit_code = null;
+
+		while ( true ) {
+			$stdout .= (string) stream_get_contents( $pipes[1] );
+			$stderr .= (string) stream_get_contents( $pipes[2] );
+			$status = proc_get_status( $process );
+
+			if ( ! $status['running'] ) {
+				$exit_code = (int) $status['exitcode'];
+				break;
+			}
+
+			if ( microtime( true ) - $started_at >= $timeout ) {
+				proc_terminate( $process );
+				$stderr .= ( '' !== $stderr ? PHP_EOL : '' ) . 'Environment check timed out.';
+				break;
+			}
+
+			usleep( 50000 );
+		}
+
+		$stdout .= (string) stream_get_contents( $pipes[1] );
+		$stderr .= (string) stream_get_contents( $pipes[2] );
+		fclose( $pipes[1] );
+		fclose( $pipes[2] );
+		$close_status = proc_close( $process );
+
+		if ( null === $exit_code || $exit_code < 0 ) {
+			$exit_code = $close_status;
+		}
+
+		return [
+			'success' => 0 === $exit_code,
+			'stdout' => $stdout,
+			'stderr' => $stderr,
+			'message' => 0 === $exit_code ? '' : 'Environment check process failed.',
+		];
+	}
+
+	private function assert_local_optimizer_runtime_compatible() {
+		$runtime_check = $this->check_local_optimizer_runtime();
+
+		if ( empty( $runtime_check['usable'] ) ) {
+			\WP_CLI::error(
+				'Local optimizer runtime is incompatible with the current environment: '
+				. $runtime_check['message']
+			);
+		}
+	}
+
 	private function ensure_local_optimizer() {
+		$this->assert_processing_environment( true );
+
 		if ( $this->is_local_optimizer_ready() ) {
 			$this->sync_local_optimizer_script();
+			$this->assert_local_optimizer_runtime_compatible();
 			return true;
 		}
 
 		\WP_CLI::log( 'Local optimizer is not installed. Setting it up automatically...' );
 		$this->install_local_optimizer();
+		$this->assert_local_optimizer_runtime_compatible();
 		return $this->is_local_optimizer_ready();
 	}
 
@@ -3263,6 +3489,20 @@ class Optimize_Images_Command {
 	}
 
 	private function get_node_version() {
+		$result = $this->run_environment_process( [ 'node', '--version' ], null, 3 );
+
+		if ( ! empty( $result['success'] ) ) {
+			$version = ltrim( trim( (string) $result['stdout'] ), 'vV' );
+
+			if ( preg_match( '/^\d+\.\d+\.\d+/', $version ) ) {
+				return $version;
+			}
+		}
+
+		if ( ! function_exists( 'exec' ) ) {
+			return null;
+		}
+
 		$output = [];
 		$status = 0;
 		exec( 'node --version 2>&1', $output, $status );
@@ -3276,6 +3516,10 @@ class Optimize_Images_Command {
 	}
 
 	private function command_exists( $command ) {
+		if ( ! function_exists( 'exec' ) ) {
+			return false;
+		}
+
 		$output = [];
 		$status = 0;
 		$check_command = '\\' === DIRECTORY_SEPARATOR
